@@ -11,12 +11,12 @@ Massive supplies the bars. NautilusTrader runs the simulation. Alpaca is reserve
 | 1 | Massive 1-minute pipeline, Parquet cache, validation, point-in-time universe | This build |
 | 2 | NautilusTrader EMA crossover, costs, risk engine, walk-forward, holdout | This build |
 | 3 | Orchestrator, Researcher, Implementer, Naysayer | Not started |
-| 4 | Backtesting Analyst, ML Specialist (XGBoost), Risk Analyst | Not started |
+| 4 | Backtesting Analyst, ML Specialist (XGBoost), Risk Analyst | Analyst report is in this build (`aegis analyze`). ML and portfolio roles are separate |
 | 5 | Experiment loop, MLflow, Postgres | Not started |
 | 6 | Alpaca paper trading | Not started |
 | 7 | Independent validation, monitoring, human-approved live trading | Not started |
 
-Packages reserved for those phases: `aegis.agents`, `aegis.ml`, `aegis.execution`, `aegis.experiments`.
+The Backtesting Analyst report lives in `aegis.analyst`. Packages reserved for later phases: `aegis.agents`, `aegis.ml`, `aegis.execution`, `aegis.experiments`.
 
 ## Setup
 
@@ -107,9 +107,30 @@ aegis backtest walk-forward --start 2025-01-02 --end 2026-06-30 --train-days 90 
 
 aegis backtest demo
 aegis backtest demo --json
+
+# Analyst report from a synthetic result. No API key and no strategy run.
+aegis analyze demo
+aegis analyze demo --json --out-dir /tmp/aegis-report
+
+# Same report from a result file. Bars are optional and only used for the benchmark and regimes.
+aegis analyze report --input result.json --bars bars.parquet --out-dir /tmp/aegis-report
 ```
 
 `backtest run` uses a 20/50 EMA and a 14-period ATR. `backtest demo` uses 5/12 and a 10-period ATR so the short fixture can warm up. Both go through the same risk engine.
+
+## Backtest analyst report
+
+`aegis.analyst` is the deterministic report the Backtesting Analyst will call. It does not import a strategy class, size a position, or run Nautilus. You hand it a finished result: trades, an equity curve, the 1x commission and slippage that were charged, optional out-of-sample fold results, and optional bars.
+
+`build_analyst_report` returns one object with `to_json()` and `to_markdown()`. The sections are:
+
+- **Performance.** Same fields as the phase-2 report: return, Sharpe (daily, `sqrt(252)`, zero risk-free rate), max drawdown, win rate, average gross R, trade count.
+- **Benchmark.** Equal-weight buy-and-hold of the supplied bars, close to close, without costs, and the strategy's excess return over that. If bars are missing, the benchmark is left empty instead of being reported as zero.
+- **Walk-forward out of sample.** Mean, median, min, max, fraction positive, compounded chain, trade count, and trade-weighted average R of the folds you supply. A single curve is not sliced up and called walk-forward.
+- **Cost and slippage sensitivity.** 1x, 2x, and 3x the stated per-share commission and bps slippage. The fill path does not change, so each extra multiple subtracts another round trip of the same fee from pnl and from the equity curve. R-multiples stay gross.
+- **Regime breakdown.** Ex-post labels on this window. Trend is the session's equal-weight last/first close return: up, down, or range when the move is within 5 bps. Volatility is the equal-weight standard deviation of one-minute returns, split at the sample median. Strategy days and entry-day trade pnl are attributed to those buckets.
+
+The result JSON is schema version 1 (`strategy`, `starting_equity`, `commission_per_share`, `slippage_bps`, `equity_curve`, `trades`, optional `folds` and `parameters`). Timestamps need a timezone. Bars are a parquet sidecar (`symbol`, `ts`, `close`), not embedded in the JSON. `aegis analyze demo` and `aegis analyze report` both refuse a result whose dates overlap the holdout.
 
 ## Universe
 
@@ -143,7 +164,7 @@ The report prints total return, Sharpe (daily returns, `sqrt(252)`, zero risk-fr
 
 `HOLDOUT_START=2026-07-01` and `HOLDOUT_END=2026-10-31` are the protected final window. Backfill is allowed to **store** those dates so they exist later. Research reads are not allowed to **open** them.
 
-`aegis backtest run`, `aegis backtest walk-forward`, and `BarCache.read_bars` (the default purpose is `research`) raise if the requested range overlaps the holdout. There is no research function that returns the overlapping part and drops the rest. A full free-tier backfill includes this window in the cache; point research backtests at a range that ends on or before 2026-06-30. Change the holdout dates only on purpose. This build does not include the one-shot final evaluation that will be allowed to read it.
+`aegis backtest run`, `aegis backtest walk-forward`, `aegis analyze demo`, `aegis analyze report`, and `BarCache.read_bars` (the default purpose is `research`) raise if the requested range overlaps the holdout. There is no research function that returns the overlapping part and drops the rest. A full free-tier backfill includes this window in the cache; point research backtests at a range that ends on or before 2026-06-30. Change the holdout dates only on purpose. This build does not include the one-shot final evaluation that will be allowed to read it.
 
 ## Tests
 
@@ -151,7 +172,7 @@ The report prints total return, Sharpe (daily returns, `sqrt(252)`, zero risk-fr
 pytest
 ```
 
-The suite covers the HTTP client with a fake transport (pagination, `limit=50000`, 429 retry, secret redaction), the rate limiter, cache partitions, resume-without-redownload, split and dividend adjustment, bar validation, holdout refusal, every risk rule, walk-forward folds, and an end-to-end Nautilus backtest on the synthetic fixture. No test calls Massive or Alpaca.
+The suite covers the HTTP client with a fake transport (pagination, `limit=50000`, 429 retry, secret redaction), the rate limiter, cache partitions, resume-without-redownload, split and dividend adjustment, bar validation, holdout refusal, every risk rule, walk-forward folds, an end-to-end Nautilus backtest on the synthetic fixture, and the analyst report (benchmark, walk-forward summary, 1x/2x/3x costs, regimes) on synthetic trades. No test calls Massive or Alpaca.
 
 ## NautilusTrader
 
@@ -169,10 +190,11 @@ Other behavior that matters when you read a report:
 ```
 src/aegis/
   config.py            environment settings
-  cli.py               aegis data|backtest
+  cli.py               aegis data|backtest|analyze
   holdout.py           protected window
   data/                Massive client, cache, query, validation, universe
   backtest/            risk engine, EMA strategy, report, walk-forward
+  analyst/             benchmark, walk-forward summary, cost sensitivity, regimes
   agents/  ml/  execution/  experiments/    later phases
 config/universe.yaml
 ```
