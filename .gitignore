@@ -8,5 +8,7 @@ build/
 .env
 data/cache/
 data/paper/
+mlruns/
+.mlflow/
 *.parquet
 .DS_Store

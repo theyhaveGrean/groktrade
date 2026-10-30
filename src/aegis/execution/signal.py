@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from nautilus_trader.indicators import ExponentialMovingAverage
 
 from aegis.backtest.risk import AtrState
-from aegis.backtest.strategy import detect_ema_cross
+from aegis.strategies.ema import detect_ema_cross
 from aegis.execution.models import MinuteBar
 
 

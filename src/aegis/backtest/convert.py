@@ -34,8 +34,10 @@ def equity_instrument(symbol: str, venue_name: str = RESEARCH_VENUE) -> Equity:
     )
 
 
-def bar_type_for(symbol: str, venue_name: str = RESEARCH_VENUE) -> BarType:
-    return BarType.from_str(f"{symbol}.{venue_name}-1-MINUTE-LAST-EXTERNAL")
+def bar_type_for(symbol: str, venue_name: str = RESEARCH_VENUE, minutes: int = 1) -> BarType:
+    if minutes < 1:
+        raise ValueError("Bar size must be at least one minute.")
+    return BarType.from_str(f"{symbol}.{venue_name}-{minutes}-MINUTE-LAST-EXTERNAL")
 
 
 def frame_to_bars(frame: pl.DataFrame, instrument: Equity, bar_type: BarType) -> list[Bar]:

@@ -1,22 +1,20 @@
 # Aegis
 
-Research foundation for an autonomous quant stack. This repository has the Massive (formerly Polygon.io) 1-minute bar pipeline, a NautilusTrader EMA-crossover backtest, and Alpaca paper execution. A deterministic risk engine gates both the backtest and every paper order. No model is allowed to override it.
-
-Massive supplies historical bars. NautilusTrader runs the simulation. Alpaca paper-trades. OpenAI agents, when they land, will research and write strategies. They will not size risk, and they cannot place live orders. Live capital needs a separate human approval that this build does not have.
+Research foundation for an autonomous quant stack. Massive (formerly Polygon.io) supplies 1-minute bars. NautilusTrader runs the simulation. Alpaca paper-trades. A deterministic risk engine sizes every backtest and paper order. Strategy plug-ins, an XGBoost signal ranker, advisory portfolio analytics, and the backtest analyst report are in this build. OpenAI agents are not. They will not size risk, and they cannot place live orders. Live capital needs a separate human approval that this build does not have.
 
 ## Phase roadmap
 
 | Phase | What | Status |
 | --- | --- | --- |
 | 1 | Massive 1-minute pipeline, Parquet cache, validation, point-in-time universe | This build |
-| 2 | NautilusTrader EMA crossover, costs, risk engine, walk-forward, holdout | This build |
+| 2 | NautilusTrader backtest, costs, risk engine, walk-forward optimization, holdout | This build |
 | 3 | Orchestrator, Researcher, Implementer, Naysayer | Not started |
-| 4 | Backtesting Analyst, ML Specialist (XGBoost), Risk Analyst | Analyst report is in this build (`aegis analyze`). ML and portfolio roles are separate |
-| 5 | Experiment loop, MLflow, Postgres | Not started |
+| 4 | Strategy plug-ins, ML ranker, portfolio analytics, analyst report | Tooling in this build; the agents are not |
+| 5 | Experiment loop and Postgres | Not started |
 | 6 | Alpaca paper trading | This build |
 | 7 | Independent validation, monitoring, human-approved live trading | Not started |
 
-The Backtesting Analyst report lives in `aegis.analyst`. Paper execution lives in `aegis.execution`. Packages reserved for later phases: `aegis.agents`, `aegis.ml`, `aegis.experiments`.
+`aegis.strategies` is the harness and the signal plug-ins. `aegis.ml` trains the ranker. `aegis.portfolio` is advisory. `aegis.analyst` builds the finished-result report. `aegis.execution` is Alpaca paper trading. `aegis.agents` and `aegis.experiments` are still empty.
 
 ## Setup
 
@@ -102,8 +100,12 @@ aegis data update --skip-corporate-actions
 # Missing minutes, inverted bars, extreme returns, extended-hours prints.
 aegis data validate --start 2025-01-02 --end 2025-06-30
 
-# Research backtest on the cache. Refuses the holdout.
+# Research backtest on the cache. Refuses the holdout. Default strategy is ema_cross.
 aegis backtest run --start 2025-01-02 --end 2026-06-30
+aegis backtest run --strategy macd --timeframe 15min --start 2025-01-02 --end 2026-06-30
+
+# Names the optimizer can search.
+aegis optimize strategies
 
 # Walk-forward fold dates. Also refuses the holdout. Does not run a backtest.
 aegis backtest walk-forward --start 2025-01-02 --end 2026-06-30 --train-days 90 --test-days 30
@@ -126,7 +128,102 @@ aegis analyze demo --json --out-dir /tmp/aegis-report
 aegis analyze report --input result.json --bars bars.parquet --out-dir /tmp/aegis-report
 ```
 
-`backtest run` uses a 20/50 EMA and a 14-period ATR. `backtest demo` uses 5/12 and a 10-period ATR so the short fixture can warm up. Both go through the same risk engine.
+## Walk-forward optimization
+
+`aegis optimize` searches a registered strategy. Parameters and their default grids live on that strategy's Pydantic model (`SearchMeta` on each field), not in the optimizer. `ema_cross` sweeps fast period, slow period, ATR stop multiple, and bar timeframe. Bar timeframe aggregates the cached 1-minute bars (5min, 15min, 30min, 60min) before the backtest, aligned to 9:30 ET. ATR length stays at 14 unless you override it. Risk limits other than the ATR multiple stay fixed.
+
+On 1-minute bars, EMA 20/50 trades about 1,200 times per name over 18 months and loses roughly 25–29% net on every name, with average net R near zero. Costs dominate that timeframe. Sweep `bar_timeframe` (and slower EMAs) instead of trusting the 1-minute default.
+
+```bash
+aegis optimize strategies
+aegis optimize space ema_cross
+```
+
+For each fold the search runs every parameter set on the in-sample window, keeps the best in-sample Sharpe (ties keep the first set in the sorted grid), and runs that set once on the following out-of-sample window. Parameter sets that were not selected are not scored out of sample.
+
+Rolling folds slide a fixed training window. Anchored folds keep the training start date and lengthen the window. `step-days` defaults to `test-days` and must be at least `test-days`, so out-of-sample windows do not overlap. The stitched curve compounds those out-of-sample segments only.
+
+Trials run in separate processes, default `min(cpu-1, 6)`. Every in-sample evaluation is one trial. The ledger is Parquet (`params_json` holds the full set) and is readable with DuckDB. Out-of-sample columns are null unless that row was selected. The report prints stitched OOS Sharpe, the best single-fold OOS Sharpe, the trial count, the deflated Sharpe, and parameter stability across folds. Average R in every report is net of commission and slippage.
+
+The holdout guard applies. A range that overlaps it is refused before any trial starts.
+
+```bash
+# Default ema_cross grid, but only 5- and 15-minute bars.
+aegis optimize run \
+  --strategy ema_cross \
+  --start 2025-01-02 --end 2026-06-30 \
+  --set bar_timeframe=5min,15min \
+  --mode rolling --train-days 60 --test-days 20 --embargo-days 5 \
+  --workers 4 \
+  --ledger data/cache/trials/trials.parquet
+
+# Replace the fast/slow grid too. Other axes keep the model's default grid.
+aegis optimize run \
+  --strategy ema_cross \
+  --start 2025-01-02 --end 2026-06-30 \
+  --set fast_period=12,20 --set slow_period=50,80 \
+  --set atr_multiplier=2,3 --set bar_timeframe=15min \
+  --method random --samples 12 --seed 7 --mode anchored
+
+# Synthetic week, no API key. Smoke grid unless you pass --set.
+aegis optimize demo --workers 2 --ledger data/cache/trials/trials.parquet
+```
+
+`data/cache/trials/oos_equity.parquet` is the stitched out-of-sample equity, tagged with `study_id` and `fold_index`.
+
+```bash
+python -c "import duckdb; print(duckdb.sql(\"SELECT strategy, n_trials, count(*) FROM read_parquet('data/cache/trials/trials.parquet') GROUP BY 1, 2\"))"
+```
+
+## Strategy plug-ins
+
+`HarnessStrategy` is the only Nautilus strategy that submits orders. It registers indicators, asks `RiskEngine` for size, stop, and target, and enforces the entry window, the 15:55 flatten, the daily loss cutoff, and the kill switch. A plug-in is a `SignalModel`: on each completed bar it returns `enter_long`, `enter_short`, `exit`, or `none`, plus optional stop and target hints. A hint that would widen risk is ignored. A tighter stop is kept and the quantity stays the one the engine approved, so risk only shrinks.
+
+Each plug-in is a `StrategyParams` subclass with `SearchMeta` on the tunable fields, including `bar_timeframe` (`1min`, `5min`, `15min`, `30min`, `60min`). `aegis optimize` reads that model. The cached bars stay 1-minute; `resample_bars` aggregates them to the session open before the backtest. New strategies default to 5-minute bars because a 1-minute EMA cross is cost-dominated. `ema_cross` stays on 1-minute bars so the synthetic baseline trade is unchanged.
+
+Registered names:
+
+| Name | Signal |
+| --- | --- |
+| `ema_cross` | Fast EMA crosses above the slow EMA. Report label remains `ema_crossover`. |
+| `macd` | MACD line crosses above its signal line. |
+| `opening_range_breakout` | Close breaks the opening-range high, once per session. |
+| `mean_reversion` | Close is a negative Bollinger z-score and below session VWAP. |
+| `volatility_breakout` | Close breaks the prior N-bar high. |
+
+`aegis backtest demo --strategy macd` uses a short synthetic path and does not need a cache. `aegis backtest signals` runs the static policy check.
+
+Signal modules may import the parameter model, the signal types, the registry helper, and `resample`. They may not import Nautilus, the broker, or call `submit_order`. `check_signal_source` is the check a later sandbox can run on generated text before import.
+
+```python
+from aegis.strategies.policy import check_signal_package
+check_signal_package()
+```
+
+## ML signal ranker
+
+`aegis.ml.train_signal_ranker` builds causal price, volume, and volatility features, labels candidate entry times with the net R of a long trade after commission and slippage, and fits XGBoost to predict that R. Validation is a purged, embargoed walk-forward: a training row whose label interval overlaps the test window is dropped. The search logs each trial to a local MLflow file store (`mlruns/` by default, gitignored). The result also includes a leakage report, a feature-importance stability report, and a comparison against taking every signal and against ranking by `ret_5`.
+
+Any bar whose Eastern session sits in the holdout raises before a model is fit.
+
+```python
+from aegis.ml import train_signal_ranker
+ranker, result = train_signal_ranker(bars, holdout=settings.holdout, tracking_uri="mlruns")
+ranked = ranker.rank(features)
+```
+
+## Portfolio analytics
+
+`aegis.portfolio.analyze_portfolio` is advisory. It reports return correlations, concentration (Herfindahl and the 25% cap as a warning), drawdown span, volatility and trend regime buckets, and four stress paths (scaled returns, correlation to 1, drop the largest weight, worst overlapping day). The allocation suggestion is inverse-volatility, long only, capped at 25% when that cap can be met. It does not call `RiskEngine.evaluate_entry` and it does not change `RiskLimits`.
+
+```python
+from aegis.portfolio import analyze_portfolio, series_from_report
+report = analyze_portfolio([series_from_report(ema_report), series_from_report(macd_report)])
+```
+
+A new strategy is a module under `src/aegis/strategies/` with a `StrategyParams` subclass, a `SignalModel`, and a `register_signal(...)` call. Import it from `aegis.strategies` so the name shows up in `aegis optimize strategies`.
+
+`backtest run` defaults to `ema_cross` (20/50 EMA, 14-period ATR, 1-minute bars). `backtest demo` uses 5/12 and a 10-period ATR so the short fixture can warm up. Both go through the same harness and the same risk engine.
 
 ## Backtest analyst report
 
@@ -168,7 +265,9 @@ If the runner does not install the engine, the strategy refuses to trade. The ba
 
 Costs, on the venue rather than inside the signal: **$0.005 per share** plus **5 bps of notional on every fill**, both sides. That slippage is deterministic. It is not Nautilus's one-tick coin flip. The account is margin with 2x leverage so five 25% positions are possible; the risk engine is what actually caps exposure.
 
-The report prints total return, Sharpe (daily returns, `sqrt(252)`, zero risk-free rate), max drawdown, win rate, average R-multiple, trade count, and equal-weight buy-and-hold of the symbols in the run. R is gross price R against the initial stop. PnL is net of commission and slippage. Buy-and-hold is close-to-close, fully invested, without costs, so it is not the same capital schedule as the intraday strategy.
+The report prints total return, Sharpe (daily returns, `sqrt(252)`, zero risk-free rate), max drawdown, win rate, average R-multiple, trade count, and equal-weight buy-and-hold of the symbols in the run. R is net of commission and slippage: realized PnL divided by the initial risk in dollars. Buy-and-hold is close-to-close, fully invested, without costs, so it is not the same capital schedule as the intraday strategy.
+
+`PerformanceReport.to_dict()` is the document the Backtesting Analyst will read (`schema_version` 1.1). It adds the parameter set, the cost assumptions, a snapshot of the risk limits that were installed, daily returns, profit factor, Sortino, and expectancy. `BacktestReport.from_performance` validates that JSON. The snapshot does not change the engine.
 
 ## Holdout
 
@@ -182,7 +281,7 @@ The report prints total return, Sharpe (daily returns, `sqrt(252)`, zero risk-fr
 pytest
 ```
 
-The suite covers the HTTP client with a fake transport (pagination, `limit=50000`, 429 retry, secret redaction), the rate limiter, cache partitions, resume-without-redownload, split and dividend adjustment, bar validation, holdout refusal, every risk rule, walk-forward folds, an end-to-end Nautilus backtest on the synthetic fixture, the analyst report (benchmark, walk-forward summary, 1x/2x/3x costs, regimes) on synthetic trades, and the paper path against a fake Alpaca client (every risk refusal, buying power, tradable symbol, kill switch, 15:55 flatten, reconciliation mismatch). No test calls Massive or Alpaca.
+The suite covers the HTTP client with a fake transport (pagination, `limit=50000`, 429 retry, secret redaction), the rate limiter, cache partitions, resume-without-redownload, split and dividend adjustment, bar validation, holdout refusal, every risk rule, walk-forward folds, the optimizer ledger, an end-to-end Nautilus backtest on the synthetic fixture, the signal plug-ins, the signal-module policy check, purged walk-forward training on synthetic bars, the advisory portfolio report, the analyst report, and the paper path against a fake Alpaca client. No test calls Massive, Alpaca, or OpenAI.
 
 ## NautilusTrader
 
@@ -200,19 +299,22 @@ Other behavior that matters when you read a report:
 ```
 src/aegis/
   config.py            environment settings
-  cli.py               aegis data|backtest|paper|analyze
+  cli.py               aegis data|backtest|optimize|paper|analyze
   holdout.py           protected window
   data/                Massive client, cache, query, validation, universe
-  backtest/            risk engine, EMA strategy, report, walk-forward
+  backtest/            risk engine, report, walk-forward, optimizer
+  strategies/          harness, signal plug-ins, registry, resample, policy
   analyst/             benchmark, walk-forward summary, cost sensitivity, regimes
+  ml/                  features, net-R labels, XGBoost ranker, MLflow
+  portfolio/           advisory correlation, stress, and allocation
   execution/           Alpaca paper broker, IEX bars, audit, kill switch
-  agents/  ml/  experiments/    later phases
+  agents/  experiments/    later phases
 config/universe.yaml
 ```
 
 ## Paper trading
 
-`aegis paper run --strategy ema_crossover` is the only live-money-adjacent command, and the money is paper. NautilusTrader 1.231 does not ship an Alpaca adapter, so the broker and the bar feed use alpaca-py. The signal does not. A bullish or bearish cross is `detect_ema_cross`, the same function the backtest strategy calls, on the same Nautilus EMA and the same Wilder ATR. The order is sent only when `RiskEngine.evaluate_entry` approves it.
+`aegis paper run --strategy ema_crossover` is the only live-money-adjacent command, and the money is paper. NautilusTrader 1.231 does not ship an Alpaca adapter, so the broker and the bar feed use alpaca-py. The signal does not. A bullish or bearish cross is `detect_ema_cross` in `aegis.strategies.ema`, the same function the EMA signal plug-in calls, on the same Nautilus EMA and the same Wilder ATR. The order is sent only when `RiskEngine.evaluate_entry` approves it.
 
 Before the process connects it requires all three of these:
 
