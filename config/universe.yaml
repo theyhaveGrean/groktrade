@@ -1,0 +1,36 @@
+# Starter universe for the Massive free tier.
+#
+# Twenty liquid U.S. names keeps a full ~2-year, 1-minute backfill near one
+# hour at 5 requests/minute. This list is today's survivors, not a historical
+# index. Point-in-time selection uses start/end. Add delisted names here with
+# an end date when a reliable source is wired; select_as_of drops them after
+# that date. Do not delete them.
+#
+# Example (commented, not an active member):
+# - symbol: LEH
+#   name: Lehman Brothers
+#   listing_mic: XNYS
+#   start: 2000-01-01
+#   end: 2008-09-15
+
+universe:
+  - {symbol: AAPL, name: Apple, listing_mic: XNAS, start: 2016-01-01, end: null}
+  - {symbol: MSFT, name: Microsoft, listing_mic: XNAS, start: 2016-01-01, end: null}
+  - {symbol: NVDA, name: NVIDIA, listing_mic: XNAS, start: 2016-01-01, end: null}
+  - {symbol: AMZN, name: Amazon, listing_mic: XNAS, start: 2016-01-01, end: null}
+  - {symbol: GOOGL, name: Alphabet Class A, listing_mic: XNAS, start: 2016-01-01, end: null}
+  - {symbol: META, name: Meta Platforms, listing_mic: XNAS, start: 2016-01-01, end: null}
+  - {symbol: AVGO, name: Broadcom, listing_mic: XNAS, start: 2016-01-01, end: null}
+  - {symbol: TSLA, name: Tesla, listing_mic: XNAS, start: 2016-01-01, end: null}
+  - {symbol: AMD, name: Advanced Micro Devices, listing_mic: XNAS, start: 2016-01-01, end: null}
+  - {symbol: COST, name: Costco, listing_mic: XNAS, start: 2016-01-01, end: null}
+  - {symbol: JPM, name: JPMorgan Chase, listing_mic: XNYS, start: 2016-01-01, end: null}
+  - {symbol: V, name: Visa, listing_mic: XNYS, start: 2016-01-01, end: null}
+  - {symbol: UNH, name: UnitedHealth, listing_mic: XNYS, start: 2016-01-01, end: null}
+  - {symbol: XOM, name: Exxon Mobil, listing_mic: XNYS, start: 2016-01-01, end: null}
+  - {symbol: LLY, name: Eli Lilly, listing_mic: XNYS, start: 2016-01-01, end: null}
+  - {symbol: JNJ, name: Johnson & Johnson, listing_mic: XNYS, start: 2016-01-01, end: null}
+  - {symbol: MA, name: Mastercard, listing_mic: XNYS, start: 2016-01-01, end: null}
+  - {symbol: HD, name: Home Depot, listing_mic: XNYS, start: 2016-01-01, end: null}
+  - {symbol: WMT, name: Walmart, listing_mic: XNYS, start: 2016-01-01, end: null}
+  - {symbol: BAC, name: Bank of America, listing_mic: XNYS, start: 2016-01-01, end: null}
