@@ -16,8 +16,10 @@ from aegis.errors import AegisError
 app = typer.Typer(no_args_is_help=True, help="Aegis research foundation.")
 data_app = typer.Typer(no_args_is_help=True, help="Massive 1-minute cache.")
 backtest_app = typer.Typer(no_args_is_help=True, help="EMA crossover baseline.")
+paper_app = typer.Typer(no_args_is_help=True, help="Alpaca paper trading. Live capital is refused.")
 app.add_typer(data_app, name="data")
 app.add_typer(backtest_app, name="backtest")
+app.add_typer(paper_app, name="paper")
 
 
 def _configure_logging() -> None:
@@ -198,6 +200,87 @@ def backtest_walk_forward(
             f"{fold.fold_index}: train {fold.train_start.isoformat()}..{fold.train_end.isoformat()} "
             f"test {fold.test_start.isoformat()}..{fold.test_end.isoformat()}"
         )
+
+
+def _paper_symbols(symbols: str | None):
+    from datetime import datetime, timezone
+
+    from aegis.data.pipeline import resolve_members
+    from aegis.data.sessions import eastern_date
+
+    settings = load_settings()
+    chosen = resolve_members(settings, _symbols(symbols), eastern_date(datetime.now(timezone.utc)))
+    return settings, [member.symbol for member in chosen]
+
+
+@paper_app.command("run")
+def paper_run(
+    strategy: str = typer.Option(..., "--strategy", help="Strategy id. This build supports ema_crossover."),
+    symbols: str | None = typer.Option(None, help="Comma-separated tickers. Default: the starter universe."),
+) -> None:
+    """Trade the Alpaca paper account from the IEX minute stream.
+
+    Refuses to start unless TRADING_MODE=paper, LIVE_TRADING_ENABLED=false, and
+    ALPACA_BASE_URL is the paper endpoint. Ctrl-C cancels orders and flattens.
+    """
+    _configure_logging()
+    from aegis.execution.broker import connect_paper_broker
+    from aegis.execution.feed import connect_iex_feed
+    from aegis.execution.session import PaperSession
+
+    try:
+        settings, names = _paper_symbols(symbols)
+        if strategy != "ema_crossover":
+            raise AegisError(f"Unknown strategy {strategy!r}. This paper build runs ema_crossover.")
+        broker = connect_paper_broker(settings)
+        feed = connect_iex_feed(settings)
+        session = PaperSession(settings, broker, names, strategy=strategy)
+    except (AegisError, ValueError) as exc:
+        _fail(exc if isinstance(exc, AegisError) else AegisError(str(exc)))
+    try:
+        session.serve(feed)
+    except KeyboardInterrupt:
+        try:
+            session.flatten_all(reason="shutdown")
+        except Exception as exc:
+            typer.secho(f"Shutdown flatten failed: {exc}", err=True, fg=typer.colors.RED)
+        raise typer.Exit(code=130) from None
+
+
+@paper_app.command("status")
+def paper_status(
+    as_json: bool = typer.Option(False, "--json", help="Print the status as JSON."),
+) -> None:
+    """Show the kill switch, broker equity, positions, and the last reconciliation."""
+    _configure_logging()
+    import json
+
+    from aegis.execution.broker import connect_paper_broker
+    from aegis.execution.session import build_status
+
+    settings = load_settings()
+    try:
+        report = build_status(settings, connect_paper_broker(settings))
+    except (AegisError, ValueError) as exc:
+        _fail(exc if isinstance(exc, AegisError) else AegisError(str(exc)))
+    typer.echo(json.dumps(report.to_dict(), indent=2) if as_json else report.render())
+    if report.mismatch:
+        raise typer.Exit(code=2)
+
+
+@paper_app.command("kill")
+def paper_kill() -> None:
+    """Arm the kill file, cancel every open order, and flatten the paper account."""
+    _configure_logging()
+    from aegis.execution.broker import connect_paper_broker
+    from aegis.execution.session import execute_kill
+
+    settings = load_settings()
+    try:
+        execute_kill(settings, connect_paper_broker(settings), reason="aegis paper kill")
+    except (AegisError, ValueError) as exc:
+        _fail(exc if isinstance(exc, AegisError) else AegisError(str(exc)))
+    typer.echo("Kill switch armed. Canceled open orders and flattened positions.")
 
 
 if __name__ == "__main__":

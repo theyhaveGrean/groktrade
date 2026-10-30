@@ -1,8 +1,8 @@
 # Aegis
 
-Research foundation for an autonomous quant stack. This repository is phases 1 and 2 of a seven-phase platform: a Massive (formerly Polygon.io) 1-minute bar pipeline, and a NautilusTrader EMA-crossover backtest with a deterministic risk engine that no model is allowed to override.
+Research foundation for an autonomous quant stack. This repository has the Massive (formerly Polygon.io) 1-minute bar pipeline, a NautilusTrader EMA-crossover backtest, and Alpaca paper execution. A deterministic risk engine gates both the backtest and every paper order. No model is allowed to override it.
 
-Massive supplies the bars. NautilusTrader runs the simulation. Alpaca is reserved for paper trading in a later phase. OpenAI agents are reserved for the phases after this one. They will research and write strategies. They will not size risk.
+Massive supplies historical bars. NautilusTrader runs the simulation. Alpaca paper-trades. OpenAI agents, when they land, will research and write strategies. They will not size risk, and they cannot place live orders. Live capital needs a separate human approval that this build does not have.
 
 ## Phase roadmap
 
@@ -13,10 +13,10 @@ Massive supplies the bars. NautilusTrader runs the simulation. Alpaca is reserve
 | 3 | Orchestrator, Researcher, Implementer, Naysayer | Not started |
 | 4 | Backtesting Analyst, ML Specialist (XGBoost), Risk Analyst | Not started |
 | 5 | Experiment loop, MLflow, Postgres | Not started |
-| 6 | Alpaca paper trading | Not started |
+| 6 | Alpaca paper trading | This build |
 | 7 | Independent validation, monitoring, human-approved live trading | Not started |
 
-Packages reserved for those phases: `aegis.agents`, `aegis.ml`, `aegis.execution`, `aegis.experiments`.
+Packages reserved for the phases that are not in this build: `aegis.agents`, `aegis.ml`, `aegis.experiments`. Paper execution lives in `aegis.execution`.
 
 ## Setup
 
@@ -33,11 +33,14 @@ Put your key in `.env` or the environment. Config is read from the environment o
 
 ```bash
 MASSIVE_API_KEY=your-key
+ALPACA_API_KEY=your-paper-key
+ALPACA_SECRET_KEY=your-paper-secret
+ALPACA_BASE_URL=https://paper-api.alpaca.markets
 TRADING_MODE=paper
 LIVE_TRADING_ENABLED=false
 ```
 
-`TRADING_MODE=live` or `LIVE_TRADING_ENABLED=true` is rejected. This build has no live-order path.
+`TRADING_MODE=live`, `LIVE_TRADING_ENABLED=true`, or an `ALPACA_BASE_URL` other than `https://paper-api.alpaca.markets` is rejected. The paper client is constructed with `paper=True` and that host only. This build has no live-order path.
 
 You can run the synthetic backtest and the test suite with no keys:
 
@@ -107,6 +110,13 @@ aegis backtest walk-forward --start 2025-01-02 --end 2026-06-30 --train-days 90 
 
 aegis backtest demo
 aegis backtest demo --json
+
+# Paper account. Requires Alpaca paper keys. Does not start on a live URL.
+aegis paper run --strategy ema_crossover
+aegis paper run --strategy ema_crossover --symbols AAPL,MSFT
+aegis paper status
+aegis paper status --json
+aegis paper kill
 ```
 
 `backtest run` uses a 20/50 EMA and a 14-period ATR. `backtest demo` uses 5/12 and a 10-period ATR so the short fixture can warm up. Both go through the same risk engine.
@@ -131,7 +141,7 @@ Listing MIC is metadata. Every research instrument is simulated on one Nautilus 
 - Initial target at least 2.5R, rounded away from the entry so the ratio cannot fall under 2.5
 - Entries only from 9:35 to 15:30 America/New_York, weekdays
 - Flatten from 15:55 America/New_York
-- `RISK_KILL_SWITCH=true` latches an emergency stop until something in-process calls `reset`
+- `RISK_KILL_SWITCH=true` latches an emergency stop until something in-process calls `reset`. Paper trading also stops when `data/paper/KILL` exists. `aegis paper kill` writes that file, cancels every order, and flattens. Deleting the file is manual; there is no unkill command.
 
 If the runner does not install the engine, the strategy refuses to trade. The baseline is long-only. The engine also knows how to price a short, for later strategies.
 
@@ -151,7 +161,7 @@ The report prints total return, Sharpe (daily returns, `sqrt(252)`, zero risk-fr
 pytest
 ```
 
-The suite covers the HTTP client with a fake transport (pagination, `limit=50000`, 429 retry, secret redaction), the rate limiter, cache partitions, resume-without-redownload, split and dividend adjustment, bar validation, holdout refusal, every risk rule, walk-forward folds, and an end-to-end Nautilus backtest on the synthetic fixture. No test calls Massive or Alpaca.
+The suite covers the HTTP client with a fake transport (pagination, `limit=50000`, 429 retry, secret redaction), the rate limiter, cache partitions, resume-without-redownload, split and dividend adjustment, bar validation, holdout refusal, every risk rule, walk-forward folds, an end-to-end Nautilus backtest on the synthetic fixture, and the paper path against a fake Alpaca client (every risk refusal, buying power, tradable symbol, kill switch, 15:55 flatten, reconciliation mismatch). No test calls Massive or Alpaca.
 
 ## NautilusTrader
 
@@ -169,12 +179,39 @@ Other behavior that matters when you read a report:
 ```
 src/aegis/
   config.py            environment settings
-  cli.py               aegis data|backtest
+  cli.py               aegis data|backtest|paper
   holdout.py           protected window
   data/                Massive client, cache, query, validation, universe
   backtest/            risk engine, EMA strategy, report, walk-forward
-  agents/  ml/  execution/  experiments/    later phases
+  execution/           Alpaca paper broker, IEX bars, audit, kill switch
+  agents/  ml/  experiments/    later phases
 config/universe.yaml
 ```
+
+## Paper trading
+
+`aegis paper run --strategy ema_crossover` is the only live-money-adjacent command, and the money is paper. NautilusTrader 1.231 does not ship an Alpaca adapter, so the broker and the bar feed use alpaca-py. The signal does not. A bullish or bearish cross is `detect_ema_cross`, the same function the backtest strategy calls, on the same Nautilus EMA and the same Wilder ATR. The order is sent only when `RiskEngine.evaluate_entry` approves it.
+
+Before the process connects it requires all three of these:
+
+- `TRADING_MODE=paper`
+- `LIVE_TRADING_ENABLED=false`
+- `ALPACA_BASE_URL=https://paper-api.alpaca.markets`
+
+Keys are read from `ALPACA_API_KEY` and `ALPACA_SECRET_KEY`. They are not written into the audit log. A client whose base URL is the live host is rejected even if it was constructed with `paper=True`.
+
+On each new minute bar the session refreshes broker equity, buying power, positions, and open orders, then asks the risk engine. The engine's stop (2 times ATR) and target (at least 2.5R) become an Alpaca bracket: a day market entry, a stop, and a take-profit. The entry is dropped when buying power cannot cover the notional, when the asset is not tradable or not active, or when the account is blocked. Entries are allowed from 9:35 to 15:30 America/New_York. At 15:55 the poll loop cancels orders and flattens, including when no new bar has arrived. A bar timestamped earlier than that is still refused once the wall clock has reached 15:55.
+
+Daily loss is 5 percent of broker equity. The baseline is Alpaca `last_equity` (the prior close) the first time the session sees that Eastern date, then the value stored in `data/paper/state.json` so a restart mid-day does not reset the cutoff. After a breach the session stays flat until the next session even if equity recovers. That latch matches the backtest strategy. It does not trip the kill switch.
+
+`aegis paper kill` and `RISK_KILL_SWITCH=true` do. The kill file is `data/paper/KILL` unless `PAPER_KILL_FILE` is set. Either switch cancels every order and closes every position. The running process stays stopped after the file is deleted; start it again only once the file is gone and `RISK_KILL_SWITCH` is false.
+
+About every `PAPER_RECONCILE_SECONDS` (default 30) the session compares internal positions and working order ids with the broker. A quantity mismatch, a position or order only one side knows about, or an order that disappeared without a matching fill is an error in the log and a `reconcile_mismatch` line in `data/paper/audit.jsonl`. New entries stop until the books match. The books are not silently overwritten. A fill whose quantity matches the entry we sent is recorded and is not an alert. `aegis paper status` prints the same check and exits 2 when it does not match.
+
+The audit log is append-only JSONL, one object per order decision, flatten, kill, and reconciliation alert. `data/paper/` is gitignored.
+
+Bars come from Alpaca's IEX feed, both the warmup history (raw, not split-adjusted, so it matches the live prints) and the minute websocket. SIP is not requested. The default signal is the 20/50 EMA and 14-period ATR used by `aegis backtest run`. Only `ema_crossover` is accepted. Ctrl-C cancels and flattens without arming the kill file.
+
+No test in this repository calls Alpaca. Point the command at a paper account locally when you want a real fill.
 
 Cache files under `data/cache/` are gitignored.

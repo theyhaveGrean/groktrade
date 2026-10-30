@@ -1,7 +1,8 @@
-"""Aegis: data and backtest foundation for a seven-agent quant research platform.
+"""Aegis: data, backtest, and Alpaca paper execution for a quant research platform.
 
-Phases 1 and 2 live here. Later phases add ``agents``, ``ml``, ``execution``,
-and ``experiments`` without changing the deterministic risk boundary.
+The deterministic risk engine gates backtests and paper orders. Later phases
+add ``agents``, ``ml``, and ``experiments`` without moving that boundary.
+Live capital is not implemented.
 """
 
 __version__ = "0.1.0"

@@ -10,7 +10,7 @@ class MissingCredentials(AegisError):
 
 
 class LiveTradingDisabled(AegisError):
-    """This build refuses live capital."""
+    """This build refuses live capital. Paper mode is the only legal start state."""
 
 
 class MassiveAPIError(AegisError):

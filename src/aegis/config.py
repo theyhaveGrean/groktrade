@@ -53,6 +53,10 @@ class Settings(BaseSettings):
 
     trading_mode: Literal["paper", "live"] = "paper"
     live_trading_enabled: bool = False
+    paper_dir: Path = Path("data/paper")
+    paper_kill_file: Path | None = None
+    paper_reconcile_seconds: float = 30.0
+    paper_poll_seconds: float = 15.0
 
     data_cache_dir: Path = Path("data/cache")
     universe_path: Path = Path("config/universe.yaml")
@@ -85,6 +89,8 @@ class Settings(BaseSettings):
             raise ValueError("STARTING_EQUITY must be positive.")
         if self.commission_per_share < 0 or self.slippage_bps < 0:
             raise ValueError("Commission and slippage cannot be negative.")
+        if self.paper_reconcile_seconds <= 0 or self.paper_poll_seconds <= 0:
+            raise ValueError("Paper reconcile and poll intervals must be positive.")
         return self
 
     @property
@@ -103,6 +109,21 @@ class Settings(BaseSettings):
                 "MASSIVE_API_KEY is empty. The synthetic backtest does not need a key."
             )
         return value
+
+    def require_alpaca_credentials(self) -> tuple[str, str]:
+        """Return the paper key pair. Empty values are treated as missing."""
+        if self.alpaca_api_key is None or self.alpaca_secret_key is None:
+            raise MissingCredentials(
+                "ALPACA_API_KEY and ALPACA_SECRET_KEY must both be set. "
+                "They are read from the environment only."
+            )
+        key = self.alpaca_api_key.get_secret_value().strip()
+        secret = self.alpaca_secret_key.get_secret_value().strip()
+        if not key or not secret:
+            raise MissingCredentials(
+                "ALPACA_API_KEY and ALPACA_SECRET_KEY must both be non-empty."
+            )
+        return key, secret
 
     def assert_paper_mode(self) -> None:
         """This build has no live-order path. Paper mode is the only legal state."""

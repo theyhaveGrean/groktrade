@@ -24,6 +24,26 @@ from aegis.data.sessions import eastern_date
 from aegis.errors import RiskEngineNotInstalled
 
 
+def detect_ema_cross(
+    previous: tuple[float, float] | None,
+    fast: float,
+    slow: float,
+    *,
+    ready: bool,
+) -> tuple[bool, bool]:
+    """Return ``(crossed_up, crossed_down)`` for one new EMA pair.
+
+    ``previous`` is the last ``(fast, slow)`` pair seen while both averages
+    were warmed up. The caller stores the new pair after this returns. Paper
+    trading imports this so a live bar uses the same cross as the backtest.
+    """
+    if not ready or previous is None:
+        return False, False
+    crossed_up = previous[0] <= previous[1] and fast > slow
+    crossed_down = previous[0] >= previous[1] and fast < slow
+    return crossed_up, crossed_down
+
+
 class EmaCrossConfig(StrategyConfig, frozen=True):
     instrument_ids: list[str]
     bar_types: list[str]
@@ -216,13 +236,14 @@ class EmaCrossStrategy(Strategy):
         fast: ExponentialMovingAverage,
         slow: ExponentialMovingAverage,
     ) -> tuple[bool, bool]:
-        crossed_up = False
-        crossed_down = False
-        if fast.initialized and slow.initialized:
-            previous = self._prev[symbol]
-            if previous is not None:
-                crossed_up = previous[0] <= previous[1] and fast.value > slow.value
-                crossed_down = previous[0] >= previous[1] and fast.value < slow.value
+        ready = fast.initialized and slow.initialized
+        crossed_up, crossed_down = detect_ema_cross(
+            self._prev[symbol],
+            fast.value,
+            slow.value,
+            ready=ready,
+        )
+        if ready:
             self._prev[symbol] = (fast.value, slow.value)
         return crossed_up, crossed_down
 
