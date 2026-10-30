@@ -156,15 +156,16 @@ class HarnessStrategy(Strategy):
     def on_position_closed(self, event) -> None:
         symbol = event.instrument_id.symbol.value
         plan = self._plans.pop(symbol, None)
-        reason = self._exit_reasons.pop(symbol, None)
+        stamped = self._exit_reasons.pop(symbol, None)
         entry = float(event.avg_px_open)
         exit_price = float(event.avg_px_close)
-        if reason is None and plan is not None:
-            if abs(exit_price - plan.stop) <= abs(exit_price - plan.target):
-                reason = "stop"
-            else:
-                reason = "target"
-        reason = reason or "unknown"
+        reason = resolve_exit_reason(
+            stamped=stamped,
+            closing_tags=_closing_tags(self, event),
+            exit_price=exit_price,
+            stop=None if plan is None else plan.stop,
+            target=None if plan is None else plan.target,
+        )
         pnl = float(event.realized_pnl.as_double())
         quantity = int(event.peak_qty.as_double())
         # Net R: realized PnL already includes commission and the slippage
@@ -223,14 +224,17 @@ class HarnessStrategy(Strategy):
 
     def _flatten(self, instrument_id: InstrumentId, reason: str) -> None:
         symbol = instrument_id.symbol.value
-        self._exit_reasons[symbol] = reason
         if reason == "daily loss cutoff":
             if self.equity_curve:
                 self._halted_days.add(eastern_date(self.equity_curve[-1][0]))
         has_orders = len(self.cache.orders_open(instrument_id=instrument_id)) > 0
         in_position = not self.portfolio.is_flat(instrument_id)
+        # A flatten on a flat book must not stick to the next trade. A later
+        # target fill was inheriting "daily loss cutoff" from that stamp.
         if not has_orders and not in_position:
+            self._exit_reasons.pop(symbol, None)
             return
+        self._exit_reasons[symbol] = reason
         self.cancel_all_orders(instrument_id)
         if in_position:
             self.close_all_positions(instrument_id, tags=[reason.upper().replace(" ", "_")])
@@ -250,6 +254,7 @@ class HarnessStrategy(Strategy):
         if self._day != session:
             self._day = session
             self._day_start_equity = equity
+            self._exit_reasons.clear()
 
     def _equity(self, venue: Venue) -> float:
         account = self.portfolio.account(venue)
@@ -465,5 +470,57 @@ def _load(path: str):
     return getattr(module, attr)
 
 
+def resolve_exit_reason(
+    *,
+    stamped: str | None,
+    closing_tags: tuple[str, ...] | list[str],
+    exit_price: float,
+    stop: float | None,
+    target: float | None,
+) -> str:
+    """Name the fill that closed the position.
+
+    A target or stop tag wins over a forced-exit stamp. Otherwise a winner
+    that actually filled its bracket was recorded as ``daily loss cutoff``
+    when an earlier flatten, on a flat book, had left that stamp behind.
+    """
+    tags = {str(tag) for tag in closing_tags}
+    if "TARGET" in tags:
+        return "target"
+    if "STOP" in tags:
+        return "stop"
+    if stamped:
+        return stamped
+    if stop is not None and target is not None:
+        if abs(exit_price - stop) <= abs(exit_price - target):
+            return "stop"
+        return "target"
+    return "unknown"
+
+
+def _closing_tags(strategy: HarnessStrategy, event) -> tuple[str, ...]:
+    order_id = getattr(event, "closing_order_id", None)
+    if order_id is None:
+        return ()
+    try:
+        order = strategy.cache.order(order_id)
+    except Exception:
+        return ()
+    if order is None or not order.tags:
+        return ()
+    return tuple(str(tag) for tag in order.tags)
+
+
 def _utc(nanos: int) -> datetime:
     return datetime.fromtimestamp(nanos / 1_000_000_000, tz=timezone.utc)
+
+
+# Re-export the plug-in seam. Signal modules import these from
+# ``aegis.strategies.signal`` so they do not load Nautilus. The names live
+# here because the harness is the only caller that may turn a signal into an order.
+from aegis.strategies.policy import check_signal_source as check_signal_source  # noqa: E402
+from aegis.strategies.plugin import register_signal as register_signal  # noqa: E402
+from aegis.strategies.signal import BarView as BarView  # noqa: E402
+from aegis.strategies.signal import Signal as Signal  # noqa: E402
+from aegis.strategies.signal import SignalAction as SignalAction  # noqa: E402
+from aegis.strategies.signal import SignalModel as SignalModel  # noqa: E402

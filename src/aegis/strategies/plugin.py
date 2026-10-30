@@ -57,5 +57,6 @@ def register_signal(
             summary=summary,
             params_model=params_model,
             run=run,
+            model=model,
         )
     )

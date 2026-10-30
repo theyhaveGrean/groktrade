@@ -1,7 +1,7 @@
 [project]
 name = "aegis"
 version = "0.1.0"
-description = "Quant research foundation: Massive bars, deterministic risk, strategy plug-ins, an XGBoost ranker, and Alpaca paper execution."
+description = "Quant research foundation: Massive bars, deterministic risk, strategy plug-ins, research agents, and Alpaca paper execution."
 readme = "README.md"
 requires-python = ">=3.11,<3.14"
 dependencies = [
@@ -20,6 +20,7 @@ dependencies = [
     "numpy>=1.26",
     "xgboost>=2.0",
     "mlflow>=2.14",
+    "openai>=1.40",
 ]
 
 [project.optional-dependencies]
@@ -36,7 +37,7 @@ build-backend = "setuptools.build_meta"
 where = ["src"]
 
 [tool.setuptools.package-data]
-aegis = ["data/*.yaml"]
+aegis = ["data/*.yaml", "agents/prompts/*/*.md"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

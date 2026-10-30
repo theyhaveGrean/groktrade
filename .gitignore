@@ -8,6 +8,8 @@ build/
 .env
 data/cache/
 data/paper/
+data/audit/
+data/research/
 mlruns/
 .mlflow/
 *.parquet
