@@ -9,26 +9,19 @@ strategy starts; the strategy refuses to trade if that install is skipped.
 from __future__ import annotations
 
 from datetime import date
-from decimal import Decimal
 
 import polars as pl
-from nautilus_trader.backtest.engine import BacktestEngine
-from nautilus_trader.config import BacktestEngineConfig, LoggingConfig
-from nautilus_trader.model.currencies import USD
-from nautilus_trader.model.enums import AccountType, OmsType
-from nautilus_trader.model.identifiers import TraderId, Venue
-from nautilus_trader.model.objects import Money
+from pydantic import ValidationError
 
-from aegis.backtest.costs import EquityCommissionSlippage
-from aegis.backtest.convert import RESEARCH_VENUE, bar_type_for, equity_instrument, frame_to_bars
 from aegis.backtest.report import PerformanceReport, build_report
-from aegis.backtest.risk import RiskEngine, RiskLimits, clear_risk_engine, install_risk_engine
-from aegis.backtest.strategy import EmaCrossConfig, EmaCrossStrategy
+from aegis.backtest.risk import RiskEngine, RiskLimits
 from aegis.backtest.synthetic import synthetic_bars
 from aegis.config import Settings, load_settings
 from aegis.data.cache import BarCache
 from aegis.data.query import load_research_bars
 from aegis.holdout import DateRange, assert_dates_outside_holdout
+from aegis.strategies.ema import EmaCrossParams, EmaCrossover
+from aegis.strategies.harness import run_signal_on_bars
 
 
 def run_research_backtest(
@@ -37,46 +30,80 @@ def run_research_backtest(
     start: date,
     end: date,
     symbols: list[str] | None = None,
-    fast_period: int = 20,
-    slow_period: int = 50,
-    atr_period: int = 14,
+    strategy: str = "ema_cross",
+    fast_period: int | None = None,
+    slow_period: int | None = None,
+    atr_period: int | None = None,
+    bar_timeframe: str | None = None,
+    params: dict | None = None,
 ) -> PerformanceReport:
     """Backtest cached bars. Refuses any window that overlaps the holdout."""
     settings.assert_paper_mode()
     from aegis.data.pipeline import resolve_members
+    from aegis.strategies import get_strategy
 
     chosen = resolve_members(settings, symbols, end)
     names = [member.symbol for member in chosen]
     cache = BarCache(settings.data_cache_dir)
     bars = load_research_bars(cache, names, start, end, settings.holdout)
-    return run_ema_on_bars(
+    plugin = get_strategy(strategy)
+    raw = dict(params or {})
+    if strategy == "ema_cross":
+        raw.setdefault("fast_period", 20 if fast_period is None else fast_period)
+        raw.setdefault("slow_period", 50 if slow_period is None else slow_period)
+        raw.setdefault("atr_period", 14 if atr_period is None else atr_period)
+    else:
+        if fast_period is not None:
+            raw["fast_period"] = fast_period
+        if slow_period is not None:
+            raw["slow_period"] = slow_period
+        if atr_period is not None:
+            raw["atr_period"] = atr_period
+    if bar_timeframe is not None:
+        raw["bar_timeframe"] = bar_timeframe
+    parsed = plugin.params_model.model_validate(raw)
+    return plugin.run(
         bars,
+        parsed,
         holdout=settings.holdout,
         starting_equity=settings.starting_equity,
-        fast_period=fast_period,
-        slow_period=slow_period,
-        atr_period=atr_period,
         commission_per_share=settings.commission_per_share,
         slippage_bps=settings.slippage_bps,
-        risk_engine=RiskEngine(RiskLimits(kill_switch=settings.risk_kill_switch)),
+        kill_switch=settings.risk_kill_switch,
         log_level=settings.nautilus_log_level,
     )
 
 
-def run_demo_backtest(settings: Settings | None = None) -> PerformanceReport:
-    """Synthetic two-day EMA backtest. Does not read the cache or the network."""
+def run_demo_backtest(settings: Settings | None = None, strategy: str = "ema_cross") -> PerformanceReport:
+    """Synthetic backtest. The default is the two-day EMA fixture. No API key."""
     settings = settings or load_settings()
     settings.assert_paper_mode()
-    return run_ema_on_bars(
-        synthetic_bars(),
+    if strategy in {"ema_cross", "ema_crossover"}:
+        return run_ema_on_bars(
+            synthetic_bars(),
+            holdout=settings.holdout,
+            starting_equity=settings.starting_equity,
+            fast_period=5,
+            slow_period=12,
+            atr_period=10,
+            commission_per_share=settings.commission_per_share,
+            slippage_bps=settings.slippage_bps,
+            risk_engine=RiskEngine(RiskLimits(kill_switch=settings.risk_kill_switch)),
+            log_level=settings.nautilus_log_level,
+        )
+    from aegis.backtest.synthetic import DEMO_PARAMS, synthetic_bars_for
+    from aegis.strategies import get_strategy
+
+    plugin = get_strategy(strategy)
+    parsed = plugin.params_model.model_validate(DEMO_PARAMS[strategy])
+    return plugin.run(
+        synthetic_bars_for(strategy),
+        parsed,
         holdout=settings.holdout,
         starting_equity=settings.starting_equity,
-        fast_period=5,
-        slow_period=12,
-        atr_period=10,
         commission_per_share=settings.commission_per_share,
         slippage_bps=settings.slippage_bps,
-        risk_engine=RiskEngine(RiskLimits(kill_switch=settings.risk_kill_switch)),
+        kill_switch=settings.risk_kill_switch,
         log_level=settings.nautilus_log_level,
     )
 
@@ -96,7 +123,7 @@ def run_ema_on_bars(
     risk_engine: RiskEngine | None = None,
     install_risk: bool = True,
     log_level: str = "ERROR",
-    venue_name: str = RESEARCH_VENUE,
+    venue_name: str = "XNAS",
 ) -> PerformanceReport:
     """Run one backtest. ``holdout`` is required so there is no unguarded path.
 
@@ -111,13 +138,20 @@ def run_ema_on_bars(
     dates: set[date] = set()
     if not bars.is_empty():
         dates = set(
-            bars.select(pl.col("ts").dt.convert_time_zone("America/New_York").dt.date())
-            .to_series()
-            .to_list()
+            bars.select(pl.col("ts").dt.convert_time_zone("America/New_York").dt.date()).to_series().to_list()
         )
     assert_dates_outside_holdout(dates, holdout, purpose="EMA backtest")
     symbols = tuple(bars["symbol"].unique().sort().to_list()) if not bars.is_empty() else ()
-    if bars.is_empty():
+    timeframe = _TIMEFRAME_BY_MINUTES.get(bar_minutes, "1min")
+    try:
+        params = EmaCrossParams(
+            fast_period=fast_period,
+            slow_period=slow_period,
+            atr_period=atr_period,
+            atr_multiplier=atr_multiplier,
+            bar_timeframe=timeframe,
+        )
+    except ValidationError:
         return build_report(
             strategy="ema_crossover",
             symbols=symbols,
@@ -125,61 +159,27 @@ def run_ema_on_bars(
             equity_curve=[],
             trades=[],
             bars=bars,
+            bar_timeframe=timeframe,
+            commission_per_share=commission_per_share,
+            slippage_bps=slippage_bps,
+            risk_engine_installed=install_risk,
         )
-    if install_risk:
-        install_risk_engine(risk_engine or RiskEngine(RiskLimits(atr_multiplier=atr_multiplier)))
-    else:
-        clear_risk_engine()
-    engine: BacktestEngine | None = None
-    try:
-        engine = BacktestEngine(
-            config=BacktestEngineConfig(
-                trader_id=TraderId("AEGIS-001"),
-                logging=LoggingConfig(log_level=log_level),
-            )
-        )
-        venue = Venue(venue_name)
-        engine.add_venue(
-            venue=venue,
-            oms_type=OmsType.NETTING,
-            account_type=AccountType.MARGIN,
-            base_currency=USD,
-            starting_balances=[Money(starting_equity, USD)],
-            default_leverage=Decimal("2"),
-            fee_model=EquityCommissionSlippage(commission_per_share, slippage_bps),
-            bar_adaptive_high_low_ordering=True,
-            reject_stop_orders=False,
-        )
-        instrument_ids: list[str] = []
-        bar_types: list[str] = []
-        for symbol in symbols:
-            instrument = equity_instrument(symbol, venue_name)
-            bar_type = bar_type_for(symbol, venue_name, bar_minutes)
-            engine.add_instrument(instrument)
-            part = bars.filter(pl.col("symbol") == symbol).sort("ts")
-            engine.add_data(frame_to_bars(part, instrument, bar_type))
-            instrument_ids.append(str(instrument.id))
-            bar_types.append(str(bar_type))
-        strategy = EmaCrossStrategy(
-            EmaCrossConfig(
-                instrument_ids=instrument_ids,
-                bar_types=bar_types,
-                fast_period=fast_period,
-                slow_period=slow_period,
-                atr_period=atr_period,
-            )
-        )
-        engine.add_strategy(strategy)
-        engine.run()
-        return build_report(
-            strategy="ema_crossover",
-            symbols=symbols,
-            starting_equity=starting_equity,
-            equity_curve=list(strategy.equity_curve),
-            trades=list(strategy.trades),
-            bars=bars,
-        )
-    finally:
-        if engine is not None:
-            engine.dispose()
-        clear_risk_engine()
+    return run_signal_on_bars(
+        bars,
+        holdout=holdout,
+        signal_model=EmaCrossover,
+        params=params,
+        strategy_name="ema_crossover",
+        starting_equity=starting_equity,
+        atr_period=atr_period,
+        bar_minutes=bar_minutes,
+        commission_per_share=commission_per_share,
+        slippage_bps=slippage_bps,
+        risk_engine=risk_engine,
+        install_risk=install_risk,
+        log_level=log_level,
+        venue_name=venue_name,
+    )
+
+
+_TIMEFRAME_BY_MINUTES = {1: "1min", 5: "5min", 15: "15min", 30: "30min", 60: "60min"}

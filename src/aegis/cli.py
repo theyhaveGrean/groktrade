@@ -16,7 +16,7 @@ from aegis.errors import AegisError
 
 app = typer.Typer(no_args_is_help=True, help="Aegis research foundation.")
 data_app = typer.Typer(no_args_is_help=True, help="Massive 1-minute cache.")
-backtest_app = typer.Typer(no_args_is_help=True, help="EMA crossover baseline.")
+backtest_app = typer.Typer(no_args_is_help=True, help="Registered strategy backtests.")
 app.add_typer(data_app, name="data")
 app.add_typer(backtest_app, name="backtest")
 
@@ -125,15 +125,16 @@ def data_validate(
 
 @backtest_app.command("demo")
 def backtest_demo(
+    strategy: str = typer.Option("ema_cross", "--strategy", help="Registered strategy name."),
     as_json: bool = typer.Option(False, "--json", help="Print the report as JSON."),
 ) -> None:
-    """Run the EMA baseline on the built-in synthetic sessions. No API key."""
+    """Run a strategy on the built-in synthetic sessions. No API key."""
     _configure_logging()
     from aegis.backtest.engine import run_demo_backtest
 
     settings = load_settings()
     try:
-        report = run_demo_backtest(settings)
+        report = run_demo_backtest(settings, strategy=strategy)
     except (AegisError, ValueError) as exc:
         _fail(exc if isinstance(exc, AegisError) else AegisError(str(exc)))
     typer.echo(json.dumps(report.to_dict(), indent=2) if as_json else report.render())
@@ -144,8 +145,10 @@ def backtest_run(
     start: str = typer.Option(..., help="YYYY-MM-DD."),
     end: str = typer.Option(..., help="YYYY-MM-DD."),
     symbols: str | None = typer.Option(None, help="Comma-separated tickers."),
-    fast: int = typer.Option(20, help="Fast EMA period."),
-    slow: int = typer.Option(50, help="Slow EMA period."),
+    strategy: str = typer.Option("ema_cross", "--strategy", help="Registered strategy name."),
+    fast: int | None = typer.Option(None, help="Fast period when the strategy has fast_period."),
+    slow: int | None = typer.Option(None, help="Slow period when the strategy has slow_period."),
+    timeframe: str | None = typer.Option(None, "--timeframe", help="1min, 5min, 15min, 30min, or 60min."),
     as_json: bool = typer.Option(False, "--json", help="Print the report as JSON."),
 ) -> None:
     """Backtest cached bars. Refuses a range that overlaps the holdout."""
@@ -159,12 +162,28 @@ def backtest_run(
             start=date.fromisoformat(start),
             end=date.fromisoformat(end),
             symbols=_symbols(symbols),
+            strategy=strategy,
             fast_period=fast,
             slow_period=slow,
+            bar_timeframe=timeframe,
         )
     except (AegisError, ValueError) as exc:
         _fail(exc if isinstance(exc, AegisError) else AegisError(str(exc)))
     typer.echo(json.dumps(report.to_dict(), indent=2) if as_json else report.render())
+
+
+@backtest_app.command("signals")
+def backtest_signals() -> None:
+    """Reject signal modules that import outside the sandbox allowlist."""
+    from aegis.strategies.policy import check_signal_package
+
+    result = check_signal_package()
+    if result.passed:
+        typer.echo(f"Signal policy passed ({len(result.files_checked)} files).")
+        return
+    for violation in result.violations:
+        typer.echo(f"{violation.path}:{violation.line}: {violation.message}", err=True)
+    raise typer.Exit(code=1)
 
 
 @backtest_app.command("walk-forward")

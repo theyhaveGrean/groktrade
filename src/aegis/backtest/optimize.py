@@ -759,15 +759,26 @@ def optimize_demo(
     """
     from aegis.backtest.synthetic import OPTIMIZE_DEMO_DAYS, synthetic_bars
 
+    from aegis.strategies.params import search_spec
+
     settings = settings or load_settings()
     settings.assert_paper_mode()
-    smoke = {
-        "fast_period": [5, 8],
-        "slow_period": [21],
-        "atr_period": [10],
-        "atr_multiplier": [2.0],
-        "bar_timeframe": ["1min"],
-    }
+    plugin = get_strategy(strategy)
+    if strategy == "ema_cross":
+        smoke = {
+            "fast_period": [5, 8],
+            "slow_period": [21],
+            "atr_period": [10],
+            "atr_multiplier": [2.0],
+            "bar_timeframe": ["1min"],
+        }
+    else:
+        smoke = {}
+        for name, field in plugin.params_model.model_fields.items():
+            spec = search_spec(field)
+            if spec is None:
+                continue
+            smoke[name] = ["1min"] if name == "bar_timeframe" else [spec.default_grid[0]]
     if param_overrides:
         smoke.update(param_overrides)
     return optimize_on_bars(

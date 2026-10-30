@@ -13,11 +13,15 @@ exist or the standard deviation is zero.
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from typing import Any
 from zoneinfo import ZoneInfo
 
 import polars as pl
+from pydantic import BaseModel, ConfigDict
+
+from aegis.backtest.risk import RiskLimits
 
 NY = ZoneInfo("America/New_York")
 
@@ -56,9 +60,19 @@ class PerformanceReport:
     excess_return: float
     trades: tuple[TradeRecord, ...]
     equity_curve: tuple[tuple[datetime, float], ...] = ()
+    schema_version: str = "1.1"
+    parameters: dict[str, Any] = field(default_factory=dict)
+    commission_per_share: float | None = None
+    slippage_bps: float | None = None
+    risk_limits: dict[str, Any] = field(default_factory=dict)
+    risk_engine_installed: bool = True
+    bar_timeframe: str = "1min"
 
     def to_dict(self) -> dict:
-        return {
+        daily = _daily_rows(self.equity_curve, self.starting_equity)
+        returns = [row["return"] for row in daily]
+        profit_factor, expectancy, loss_streak = _trade_stats(self.trades)
+        payload = {
             "strategy": self.strategy,
             "symbols": list(self.symbols),
             "start": _iso(self.start),
@@ -74,6 +88,21 @@ class PerformanceReport:
             "trade_count": self.trade_count,
             "benchmark_return": self.benchmark_return,
             "excess_return": self.excess_return,
+            "schema_version": self.schema_version,
+            "parameters": dict(self.parameters),
+            "commission_per_share": self.commission_per_share,
+            "slippage_bps": self.slippage_bps,
+            "risk_limits": dict(self.risk_limits),
+            "risk_engine_installed": self.risk_engine_installed,
+            "bar_timeframe": self.bar_timeframe,
+            "profit_factor": profit_factor,
+            "sortino": _sortino(returns),
+            "expectancy": expectancy,
+            "max_consecutive_losses": loss_streak,
+            "max_drawdown_duration_days": _drawdown_duration_days(
+                [self.starting_equity, *[point[1] for point in _last_equity_by_day(self.equity_curve)]]
+            ),
+            "daily_returns": daily,
             "trades": [
                 {
                     "symbol": trade.symbol,
@@ -91,6 +120,7 @@ class PerformanceReport:
                 for trade in self.trades
             ],
         }
+        return payload
 
     def render(self) -> str:
         lines = [
@@ -128,6 +158,12 @@ def build_report(
     equity_curve: list[tuple[datetime, float]],
     trades: list[TradeRecord],
     bars: pl.DataFrame,
+    parameters: dict[str, Any] | None = None,
+    commission_per_share: float | None = None,
+    slippage_bps: float | None = None,
+    risk_limits: dict[str, Any] | None = None,
+    risk_engine_installed: bool = True,
+    bar_timeframe: str = "1min",
 ) -> PerformanceReport:
     ending = equity_curve[-1][1] if equity_curve else starting_equity
     total_return = _return(starting_equity, ending)
@@ -158,7 +194,74 @@ def build_report(
         excess_return=total_return - benchmark,
         trades=tuple(trades),
         equity_curve=tuple(equity_curve),
+        parameters=dict(parameters or {}),
+        commission_per_share=commission_per_share,
+        slippage_bps=slippage_bps,
+        risk_limits=dict(risk_limits or {}),
+        risk_engine_installed=risk_engine_installed,
+        bar_timeframe=bar_timeframe,
     )
+
+
+class BacktestReport(BaseModel):
+    """JSON document the Backtesting Analyst agent reads.
+
+    Built from :meth:`PerformanceReport.to_dict`. Costs and the risk-limit
+    snapshot are descriptive. The deterministic risk engine is still what
+    approved every order.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    schema_version: str = "1.1"
+    strategy: str
+    symbols: list[str]
+    start: str
+    end: str
+    starting_equity: float
+    ending_equity: float
+    total_return: float
+    sharpe: float | None
+    sharpe_observations: int
+    max_drawdown: float
+    win_rate: float
+    avg_r_multiple: float | None
+    trade_count: int
+    benchmark_return: float
+    excess_return: float
+    parameters: dict[str, Any] = {}
+    commission_per_share: float | None = None
+    slippage_bps: float | None = None
+    risk_limits: dict[str, Any] = {}
+    risk_engine_installed: bool = True
+    bar_timeframe: str = "1min"
+    profit_factor: float | None = None
+    sortino: float | None = None
+    expectancy: float | None = None
+    max_consecutive_losses: int = 0
+    max_drawdown_duration_days: int = 0
+    daily_returns: list[dict[str, Any]] = []
+    trades: list[dict[str, Any]] = []
+
+    @classmethod
+    def from_performance(cls, report: PerformanceReport) -> BacktestReport:
+        return cls.model_validate(report.to_dict())
+
+
+def risk_limits_snapshot(limits: RiskLimits) -> dict[str, Any]:
+    """Copy of the limits that were installed. Not a live handle."""
+    return {
+        "max_risk_per_trade": limits.max_risk_per_trade,
+        "max_positions": limits.max_positions,
+        "max_position_equity_fraction": limits.max_position_equity_fraction,
+        "daily_loss_cutoff": limits.daily_loss_cutoff,
+        "reward_to_risk": limits.reward_to_risk,
+        "atr_multiplier": limits.atr_multiplier,
+        "entry_start": limits.entry_start.strftime("%H:%M"),
+        "entry_end": limits.entry_end.strftime("%H:%M"),
+        "flatten_time": limits.flatten_time.strftime("%H:%M"),
+        "kill_switch": bool(limits.kill_switch),
+    }
 
 
 def buy_and_hold_return(bars: pl.DataFrame) -> float:
@@ -248,3 +351,73 @@ def _sharpe_text(value: float | None, observations: int) -> str:
     if value is None:
         return f"n/a ({observations} daily returns)"
     return f"{value:.2f} ({observations} daily returns)"
+
+
+def _last_equity_by_day(equity_curve: tuple[tuple[datetime, float], ...] | list) -> list[tuple[datetime, float]]:
+    by_day: dict = {}
+    order: list = []
+    for ts, equity in equity_curve:
+        day = _eastern_date(ts)
+        if day not in by_day:
+            order.append(day)
+        by_day[day] = (ts, equity)
+    return [by_day[day] for day in order]
+
+
+def _daily_rows(equity_curve, starting_equity: float) -> list[dict[str, Any]]:
+    if starting_equity <= 0 or not equity_curve:
+        return []
+    rows: list[dict[str, Any]] = []
+    previous = starting_equity
+    for ts, equity in _last_equity_by_day(equity_curve):
+        rows.append({"date": _eastern_date(ts).isoformat(), "return": equity / previous - 1.0})
+        previous = equity
+    return rows
+
+
+def _sortino(returns: list[float]) -> float | None:
+    if len(returns) < 2:
+        return None
+    mean = sum(returns) / len(returns)
+    downside = [min(value, 0.0) ** 2 for value in returns]
+    variance = sum(downside) / (len(returns) - 1)
+    if variance <= 0:
+        return None
+    return mean / math.sqrt(variance) * math.sqrt(252)
+
+
+def _trade_stats(trades: tuple[TradeRecord, ...]) -> tuple[float | None, float | None, int]:
+    if not trades:
+        return None, None, 0
+    wins = sum(trade.pnl for trade in trades if trade.pnl > 0)
+    losses = sum(trade.pnl for trade in trades if trade.pnl < 0)
+    profit_factor = None if losses == 0 else wins / abs(losses)
+    expectancy = sum(trade.pnl for trade in trades) / len(trades)
+    streak = 0
+    worst = 0
+    for trade in trades:
+        if trade.pnl < 0:
+            streak += 1
+            worst = max(worst, streak)
+        else:
+            streak = 0
+    return profit_factor, expectancy, worst
+
+
+def _drawdown_duration_days(equities: list[float]) -> int:
+    if not equities:
+        return 0
+    peak = equities[0]
+    peak_index = 0
+    worst = 0.0
+    duration = 0
+    for index, equity in enumerate(equities):
+        if equity >= peak:
+            peak = equity
+            peak_index = index
+        if peak > 0:
+            drawdown = (peak - equity) / peak
+            if drawdown > worst:
+                worst = drawdown
+                duration = index - peak_index
+    return duration
