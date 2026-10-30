@@ -1,4 +1,4 @@
-"""Command line for backfill, cache checks, and the EMA baseline."""
+"""Command line for backfill, cache checks, the EMA baseline, analyst reports, and paper trading."""
 
 from __future__ import annotations
 
@@ -17,9 +17,11 @@ app = typer.Typer(no_args_is_help=True, help="Aegis research foundation.")
 data_app = typer.Typer(no_args_is_help=True, help="Massive 1-minute cache.")
 backtest_app = typer.Typer(no_args_is_help=True, help="EMA crossover baseline.")
 paper_app = typer.Typer(no_args_is_help=True, help="Alpaca paper trading. Live capital is refused.")
+analyze_app = typer.Typer(no_args_is_help=True, help="Backtest analyst report. Does not run a strategy.")
 app.add_typer(data_app, name="data")
 app.add_typer(backtest_app, name="backtest")
 app.add_typer(paper_app, name="paper")
+app.add_typer(analyze_app, name="analyze")
 
 
 def _configure_logging() -> None:
@@ -281,6 +283,56 @@ def paper_kill() -> None:
     except (AegisError, ValueError) as exc:
         _fail(exc if isinstance(exc, AegisError) else AegisError(str(exc)))
     typer.echo("Kill switch armed. Canceled open orders and flattened positions.")
+
+
+def _emit_analysis(report, *, as_json: bool, out_dir: str | None) -> None:
+    from pathlib import Path
+
+    from aegis.analyst import write_analyst_report
+
+    if out_dir:
+        markdown_path, json_path = write_analyst_report(report, Path(out_dir))
+        typer.echo(f"Wrote {markdown_path} and {json_path}")
+    typer.echo(report.to_json() if as_json else report.to_markdown())
+
+
+@analyze_app.command("demo")
+def analyze_demo(
+    as_json: bool = typer.Option(False, "--json", help="Print the report as JSON."),
+    out_dir: str | None = typer.Option(None, "--out-dir", help="Write report.md and report.json here."),
+) -> None:
+    """Print a full analyst report from a built-in synthetic result. No API key."""
+    from aegis.analyst import build_analyst_report, demo_analysis_input
+
+    settings = load_settings()
+    settings.assert_paper_mode()
+    try:
+        report = build_analyst_report(demo_analysis_input(), holdout=settings.holdout)
+    except (AegisError, ValueError) as exc:
+        _fail(exc if isinstance(exc, AegisError) else AegisError(str(exc)))
+    _emit_analysis(report, as_json=as_json, out_dir=out_dir)
+
+
+@analyze_app.command("report")
+def analyze_report(
+    input_path: str = typer.Option(..., "--input", help="Schema v1 JSON: trades, equity curve, optional folds."),
+    bars: str | None = typer.Option(None, "--bars", help="Parquet bars (symbol, ts, close) for benchmark and regimes."),
+    as_json: bool = typer.Option(False, "--json", help="Print the report as JSON."),
+    out_dir: str | None = typer.Option(None, "--out-dir", help="Write report.md and report.json here."),
+) -> None:
+    """Build the analyst report from a result file. Refuses the holdout. Does not run a strategy."""
+    from pathlib import Path
+
+    from aegis.analyst import build_analyst_report, load_analysis_input
+
+    settings = load_settings()
+    settings.assert_paper_mode()
+    try:
+        analysis = load_analysis_input(Path(input_path), Path(bars) if bars else None)
+        report = build_analyst_report(analysis, holdout=settings.holdout)
+    except (AegisError, ValueError) as exc:
+        _fail(exc if isinstance(exc, AegisError) else AegisError(str(exc)))
+    _emit_analysis(report, as_json=as_json, out_dir=out_dir)
 
 
 if __name__ == "__main__":
