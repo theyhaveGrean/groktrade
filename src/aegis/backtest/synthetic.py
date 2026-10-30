@@ -19,10 +19,30 @@ NY = ZoneInfo("America/New_York")
 DEMO_DAYS = (date(2024, 1, 3), date(2024, 1, 4))
 
 
-def synthetic_bars(symbol: str = "AAPL") -> pl.DataFrame:
+# Weekdays used by `aegis optimize demo`. Two rolling folds fit in this span
+# with train_days=3, test_days=3, embargo_days=2, step_days=5, end=2024-01-15.
+OPTIMIZE_DEMO_DAYS = (
+    date(2024, 1, 3),
+    date(2024, 1, 4),
+    date(2024, 1, 5),
+    date(2024, 1, 8),
+    date(2024, 1, 9),
+    date(2024, 1, 10),
+    date(2024, 1, 15),
+)
+
+
+def synthetic_bars(symbol: str = "AAPL", sessions: tuple[date, ...] | list[date] | None = None) -> pl.DataFrame:
+    days = tuple(sessions) if sessions is not None else DEMO_DAYS
+    # Extra sessions repeat the trend day so a walk-forward window can trade.
+    # The default two-day demo keeps a flat second session.
+    trend_every_session = sessions is not None
     rows: list[dict[str, object]] = []
-    for index, day in enumerate(DEMO_DAYS):
-        closes = _day_one_closes() if index == 0 else _flat_closes(_day_one_closes()[-1])
+    for index, day in enumerate(days):
+        if trend_every_session or index == 0:
+            closes = _day_one_closes()
+        else:
+            closes = _flat_closes(_day_one_closes()[-1])
         rows.extend(_rows(symbol, day, closes))
     frame = pl.DataFrame(rows).with_columns(
         pl.col("ts").cast(pl.Datetime("us", "UTC")),

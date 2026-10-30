@@ -43,6 +43,18 @@ def test_fee_model_charges_commission_and_five_bps():
     assert commission.as_double() == pytest.approx(0.55)
 
 
+def test_r_multiple_is_net_of_costs():
+    report = run_demo_backtest(_settings())
+    assert report.trades
+    for trade in report.trades:
+        risk_dollars = (trade.entry_price - trade.stop_price) * trade.quantity
+        assert risk_dollars > 0
+        assert trade.r_multiple == pytest.approx(trade.pnl / risk_dollars)
+        gross = (trade.exit_price - trade.entry_price) / (trade.entry_price - trade.stop_price)
+        assert trade.r_multiple < gross - 1e-9
+    assert "net of costs" in report.render()
+
+
 def test_synthetic_backtest_produces_the_standard_report():
     settings = _settings()
     report = run_demo_backtest(settings)

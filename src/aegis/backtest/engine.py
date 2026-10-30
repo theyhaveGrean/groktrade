@@ -89,6 +89,8 @@ def run_ema_on_bars(
     fast_period: int = 20,
     slow_period: int = 50,
     atr_period: int = 14,
+    atr_multiplier: float = 2.0,
+    bar_minutes: int = 1,
     commission_per_share: float = 0.005,
     slippage_bps: float = 5.0,
     risk_engine: RiskEngine | None = None,
@@ -96,7 +98,16 @@ def run_ema_on_bars(
     log_level: str = "ERROR",
     venue_name: str = RESEARCH_VENUE,
 ) -> PerformanceReport:
-    """Run one backtest. ``holdout`` is required so there is no unguarded path."""
+    """Run one backtest. ``holdout`` is required so there is no unguarded path.
+
+    ``atr_multiplier`` is the ATR stop multiple used when this function builds
+    the risk engine. A caller that passes ``risk_engine`` keeps that engine's
+    own limits, including its multiple.
+    """
+    if atr_multiplier <= 0:
+        raise ValueError("atr_multiplier must be positive.")
+    if bar_minutes < 1:
+        raise ValueError("bar_minutes must be at least 1.")
     dates: set[date] = set()
     if not bars.is_empty():
         dates = set(
@@ -116,7 +127,7 @@ def run_ema_on_bars(
             bars=bars,
         )
     if install_risk:
-        install_risk_engine(risk_engine or RiskEngine())
+        install_risk_engine(risk_engine or RiskEngine(RiskLimits(atr_multiplier=atr_multiplier)))
     else:
         clear_risk_engine()
     engine: BacktestEngine | None = None
@@ -143,7 +154,7 @@ def run_ema_on_bars(
         bar_types: list[str] = []
         for symbol in symbols:
             instrument = equity_instrument(symbol, venue_name)
-            bar_type = bar_type_for(symbol, venue_name)
+            bar_type = bar_type_for(symbol, venue_name, bar_minutes)
             engine.add_instrument(instrument)
             part = bars.filter(pl.col("symbol") == symbol).sort("ts")
             engine.add_data(frame_to_bars(part, instrument, bar_type))

@@ -9,7 +9,7 @@ Massive supplies the bars. NautilusTrader runs the simulation. Alpaca is reserve
 | Phase | What | Status |
 | --- | --- | --- |
 | 1 | Massive 1-minute pipeline, Parquet cache, validation, point-in-time universe | This build |
-| 2 | NautilusTrader EMA crossover, costs, risk engine, walk-forward, holdout | This build |
+| 2 | NautilusTrader EMA crossover, costs, risk engine, walk-forward optimization, holdout | This build |
 | 3 | Orchestrator, Researcher, Implementer, Naysayer | Not started |
 | 4 | Backtesting Analyst, ML Specialist (XGBoost), Risk Analyst | Not started |
 | 5 | Experiment loop, MLflow, Postgres | Not started |
@@ -108,6 +108,55 @@ aegis backtest walk-forward --start 2025-01-02 --end 2026-06-30 --train-days 90 
 aegis backtest demo
 aegis backtest demo --json
 ```
+
+## Walk-forward optimization
+
+`aegis optimize` searches a registered strategy. Parameters and their default grids live on that strategy's Pydantic model (`SearchMeta` on each field), not in the optimizer. `ema_cross` sweeps fast period, slow period, ATR stop multiple, and bar timeframe. Bar timeframe aggregates the cached 1-minute bars (5min, 15min, 30min, 60min) before the backtest, aligned to 9:30 ET. ATR length stays at 14 unless you override it. Risk limits other than the ATR multiple stay fixed.
+
+On 1-minute bars, EMA 20/50 trades about 1,200 times per name over 18 months and loses roughly 25–29% net on every name, with average net R near zero. Costs dominate that timeframe. Sweep `bar_timeframe` (and slower EMAs) instead of trusting the 1-minute default.
+
+```bash
+aegis optimize strategies
+aegis optimize space ema_cross
+```
+
+For each fold the search runs every parameter set on the in-sample window, keeps the best in-sample Sharpe (ties keep the first set in the sorted grid), and runs that set once on the following out-of-sample window. Parameter sets that were not selected are not scored out of sample.
+
+Rolling folds slide a fixed training window. Anchored folds keep the training start date and lengthen the window. `step-days` defaults to `test-days` and must be at least `test-days`, so out-of-sample windows do not overlap. The stitched curve compounds those out-of-sample segments only.
+
+Trials run in separate processes, default `min(cpu-1, 6)`. Every in-sample evaluation is one trial. The ledger is Parquet (`params_json` holds the full set) and is readable with DuckDB. Out-of-sample columns are null unless that row was selected. The report prints stitched OOS Sharpe, the best single-fold OOS Sharpe, the trial count, the deflated Sharpe, and parameter stability across folds. Average R in every report is net of commission and slippage.
+
+The holdout guard applies. A range that overlaps it is refused before any trial starts.
+
+```bash
+# Default ema_cross grid, but only 5- and 15-minute bars.
+aegis optimize run \
+  --strategy ema_cross \
+  --start 2025-01-02 --end 2026-06-30 \
+  --set bar_timeframe=5min,15min \
+  --mode rolling --train-days 60 --test-days 20 --embargo-days 5 \
+  --workers 4 \
+  --ledger data/cache/trials/trials.parquet
+
+# Replace the fast/slow grid too. Other axes keep the model's default grid.
+aegis optimize run \
+  --strategy ema_cross \
+  --start 2025-01-02 --end 2026-06-30 \
+  --set fast_period=12,20 --set slow_period=50,80 \
+  --set atr_multiplier=2,3 --set bar_timeframe=15min \
+  --method random --samples 12 --seed 7 --mode anchored
+
+# Synthetic week, no API key. Smoke grid unless you pass --set.
+aegis optimize demo --workers 2 --ledger data/cache/trials/trials.parquet
+```
+
+`data/cache/trials/oos_equity.parquet` is the stitched out-of-sample equity, tagged with `study_id` and `fold_index`.
+
+```bash
+python -c "import duckdb; print(duckdb.sql(\"SELECT strategy, n_trials, count(*) FROM read_parquet('data/cache/trials/trials.parquet') GROUP BY 1, 2\"))"
+```
+
+A new strategy is a module under `src/aegis/strategies/` with a `StrategyParams` subclass and a `register(StrategyPlugin(...))` call. Import it from `aegis.strategies` so the name shows up in `aegis optimize strategies`.
 
 `backtest run` uses a 20/50 EMA and a 14-period ATR. `backtest demo` uses 5/12 and a 10-period ATR so the short fixture can warm up. Both go through the same risk engine.
 

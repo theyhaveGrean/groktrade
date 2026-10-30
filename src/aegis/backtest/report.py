@@ -1,11 +1,13 @@
-"""Standardized performance report for the EMA baseline.
+"""Standardized performance report.
 
-R-multiples are gross price R against the initial ATR stop:
-``(exit - entry) / (entry - stop)`` for a long. PnL is net of the commission
-and slippage model. Buy-and-hold is the equal-weight close-to-close return of
-the symbols in the run, fully invested, without costs. Sharpe uses daily
-equity changes and ``sqrt(252)`` with a zero risk-free rate. It is ``None``
-when fewer than two daily returns exist or the standard deviation is zero.
+R-multiples are net of costs. Realized PnL includes commission and the
+slippage charged as a fee, and R divides that PnL by the initial risk in
+dollars (stop distance times shares). Gross price R,
+``(exit - entry) / (entry - stop)``, is not what the report prints. Buy-and-hold
+is the equal-weight close-to-close return of the symbols in the run, fully
+invested, without costs. Sharpe uses daily equity changes and ``sqrt(252)``
+with a zero risk-free rate. It is ``None`` when fewer than two daily returns
+exist or the standard deviation is zero.
 """
 
 from __future__ import annotations
@@ -53,6 +55,7 @@ class PerformanceReport:
     benchmark_return: float
     excess_return: float
     trades: tuple[TradeRecord, ...]
+    equity_curve: tuple[tuple[datetime, float], ...] = ()
 
     def to_dict(self) -> dict:
         return {
@@ -100,7 +103,7 @@ class PerformanceReport:
             f"Sharpe: {_sharpe_text(self.sharpe, self.sharpe_observations)}",
             f"Max drawdown: {_pct(self.max_drawdown)}",
             f"Win rate: {_pct(self.win_rate)}",
-            f"Avg R-multiple: {_num(self.avg_r_multiple)}",
+            f"Avg R-multiple (net of costs): {_num(self.avg_r_multiple)}",
             f"Trade count: {self.trade_count}",
             f"Buy-and-hold return: {_pct(self.benchmark_return)}",
             f"Excess return vs buy-and-hold: {_pct(self.excess_return)}",
@@ -154,6 +157,7 @@ def build_report(
         benchmark_return=benchmark,
         excess_return=total_return - benchmark,
         trades=tuple(trades),
+        equity_curve=tuple(equity_curve),
     )
 
 

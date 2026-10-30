@@ -144,10 +144,16 @@ class EmaCrossStrategy(Strategy):
             else:
                 reason = "target"
         reason = reason or "unknown"
-        risk = None if plan is None else entry - plan.stop
-        r_multiple = (exit_price - entry) / risk if risk and risk > 0 else None
         pnl = float(event.realized_pnl.as_double())
         quantity = int(event.peak_qty.as_double())
+        # Net R: realized PnL already includes commission and the slippage
+        # charged by the fee model. Dividing by initial risk dollars keeps
+        # costs in the ratio instead of reporting the gross price excursion.
+        if plan is None or quantity <= 0:
+            r_multiple = None
+        else:
+            risk_dollars = abs(entry - plan.stop) * quantity
+            r_multiple = pnl / risk_dollars if risk_dollars > 0 else None
         self.trades.append(
             TradeRecord(
                 symbol=symbol,
