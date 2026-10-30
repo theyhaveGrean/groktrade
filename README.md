@@ -1,8 +1,8 @@
 # Aegis
 
-Research foundation for an autonomous quant stack. This repository is phases 1 and 2 of a seven-phase platform: a Massive (formerly Polygon.io) 1-minute bar pipeline, and a NautilusTrader EMA-crossover backtest with a deterministic risk engine that no model is allowed to override.
+Research foundation for an autonomous quant stack. This repository is phases 1 through 3 of a seven-phase platform: a Massive (formerly Polygon.io) 1-minute bar pipeline, a NautilusTrader EMA-crossover backtest with a deterministic risk engine, and an OpenAI research loop that can propose and implement signal plug-ins. No model is allowed to override the risk engine.
 
-Massive supplies the bars. NautilusTrader runs the simulation. Alpaca is reserved for paper trading in a later phase. OpenAI agents are reserved for the phases after this one. They will research and write strategies. They will not size risk.
+Massive supplies the bars. NautilusTrader runs the simulation. Alpaca is reserved for paper trading in a later phase. The phase-3 agents research and write signal modules. They do not size risk, and this phase does not start a backtest.
 
 ## Phase roadmap
 
@@ -10,13 +10,13 @@ Massive supplies the bars. NautilusTrader runs the simulation. Alpaca is reserve
 | --- | --- | --- |
 | 1 | Massive 1-minute pipeline, Parquet cache, validation, point-in-time universe | This build |
 | 2 | NautilusTrader EMA crossover, costs, risk engine, walk-forward, holdout | This build |
-| 3 | Orchestrator, Researcher, Implementer, Naysayer | Not started |
+| 3 | Orchestrator, Researcher, Implementer, Naysayer | This build |
 | 4 | Backtesting Analyst, ML Specialist (XGBoost), Risk Analyst | Not started |
 | 5 | Experiment loop, MLflow, Postgres | Not started |
 | 6 | Alpaca paper trading | Not started |
 | 7 | Independent validation, monitoring, human-approved live trading | Not started |
 
-Packages reserved for those phases: `aegis.agents`, `aegis.ml`, `aegis.execution`, `aegis.experiments`.
+`aegis.agents` is the phase-3 loop. `aegis.ml`, `aegis.execution`, and `aegis.experiments` are still reserved. The strategy harness (`aegis.strategies.harness`) is the safety-critical runner for plug-ins; until that module lands, agents code against the stub in `aegis.agents.signal_contract`.
 
 ## Setup
 
@@ -107,6 +107,9 @@ aegis backtest walk-forward --start 2025-01-02 --end 2026-06-30 --train-days 90 
 
 aegis backtest demo
 aegis backtest demo --json
+
+# Phase 3. Needs OPENAI_API_KEY. Does not backtest.
+aegis research run --objective "Mean reversion after a morning spike." --max-iterations 2
 ```
 
 `backtest run` uses a 20/50 EMA and a 14-period ATR. `backtest demo` uses 5/12 and a 10-period ATR so the short fixture can warm up. Both go through the same risk engine.
@@ -145,13 +148,47 @@ The report prints total return, Sharpe (daily returns, `sqrt(252)`, zero risk-fr
 
 `aegis backtest run`, `aegis backtest walk-forward`, and `BarCache.read_bars` (the default purpose is `research`) raise if the requested range overlaps the holdout. There is no research function that returns the overlapping part and drops the rest. A full free-tier backfill includes this window in the cache; point research backtests at a range that ends on or before 2026-06-30. Change the holdout dates only on purpose. This build does not include the one-shot final evaluation that will be allowed to read it.
 
+## Research agents
+
+Phase 3 runs four roles: Orchestrator, Researcher, Algorithm Implementer, and Naysayer. The runner is a thin tool loop in the shape of the OpenAI Agents SDK (instructions, scoped function tools, a pydantic `output_type`, a turn limit). It calls the OpenAI Chat Completions API. Tests never do. They inject a scripted client.
+
+```bash
+export OPENAI_API_KEY=sk-...
+# Optional. Default is gpt-6.1-sol. Prices below match that model ($2 / $10 per million).
+export AEGIS_RESEARCH_MODEL=gpt-6.1-sol
+# Optional per-role overrides. Empty falls back to AEGIS_RESEARCH_MODEL.
+# export AEGIS_IMPLEMENTER_MODEL=gpt-6-luna
+aegis research run --objective "Short lookback momentum on the liquid universe." --max-iterations 2
+```
+
+`--max-iterations` is the propose/critique rounds. The implementer then writes one candidate. The command prints a stop reason and the audit path. `advance_to_backtest: true` means the gates passed. `backtest_started` stays false. Phase 4 is what will run the simulation.
+
+What the run actually does:
+
+1. The orchestrator restates the objective. Constraints that ask to loosen risk, skip the naysayer, or read the holdout are dropped.
+2. The researcher proposes entry rules, exit rules, market assumptions, and a falsifiable hypothesis. It can list the universe and ask whether a date window is outside the holdout. It cannot read bars.
+3. The naysayer returns a critique with findings, severity, evidence, and a pass/fail verdict. An unresolved critical finding forces `fail`.
+4. The implementer writes `candidate.py` (a `Params` model plus one `SignalModel`) and `test_candidate.py`, only inside a scratch workspace. The workflow runs that source in the sandbox again and ignores a claim that the tests passed.
+
+A candidate is kept only as a versioned directory: `data/research/<run_id>/<sha256>/` with the signal module, the tests, `proposal.json`, `critique.json`, and `manifest.json`. The hash is the signal source. The same directory is written when the sandbox rejects the file, so the audit can point at it. Nothing is copied into `src/aegis/strategies/`.
+
+The plug-in returns an action (`enter_long`, `enter_short`, `exit`, `hold`) and a reason. Quantity, stop, and target stay on `RiskEngine` with the default `RiskLimits`. The sandbox probes that engine on a fixed 10:00 Eastern entry and records the quantity. A plug-in that imports an order API, constructs `RiskLimits`, reads `aegis.data`, or mentions a holdout date is rejected before it runs. The child process gets a scrubbed environment, a CPU and address-space limit, a wall-clock timeout, no network, and no write outside the scratch directory. `aegis/strategies/harness.py`, `aegis/backtest/risk.py`, `aegis/data/`, and `aegis/holdout.py` are not writable.
+
+The orchestrator can ask to override a risk limit or a failed validation. `decide_advancement` records the request and does not honor it. Critical findings and a failed sandbox both stop the run before any backtest.
+
+Every model message and tool call is appended to `data/audit/<run_id>.jsonl`. Prompts live in `src/aegis/agents/prompts/<role>/v1.md` (`AEGIS_PROMPT_VERSION` selects the file). The OpenAI key is read inside the client constructor. It is not a tool argument and it is scrubbed from the audit if it shows up in text. Tool handlers do not receive the settings object.
+
+Budgets are hard stops: `AEGIS_MAX_INPUT_TOKENS` (150000), `AEGIS_MAX_OUTPUT_TOKENS` (40000), `AEGIS_MAX_COST_USD` (3), `AEGIS_MAX_LLM_CALLS` (24). Crossing one aborts the run before the next call. The default prices are `AEGIS_PRICE_INPUT_PER_MTOK=2` and `AEGIS_PRICE_OUTPUT_PER_MTOK=10`. Change those if you change the model.
+
+`pytest` covers this loop with a scripted model, including one full cycle that executes the real sandbox. No test calls OpenAI.
+
 ## Tests
 
 ```bash
 pytest
 ```
 
-The suite covers the HTTP client with a fake transport (pagination, `limit=50000`, 429 retry, secret redaction), the rate limiter, cache partitions, resume-without-redownload, split and dividend adjustment, bar validation, holdout refusal, every risk rule, walk-forward folds, and an end-to-end Nautilus backtest on the synthetic fixture. No test calls Massive or Alpaca.
+The suite covers the HTTP client with a fake transport (pagination, `limit=50000`, 429 retry, secret redaction), the rate limiter, cache partitions, resume-without-redownload, split and dividend adjustment, bar validation, holdout refusal, every risk rule, walk-forward folds, an end-to-end Nautilus backtest on the synthetic fixture, and the phase-3 agent loop with a scripted model (sandbox policy, budgets, secret redaction, and one full research cycle). No test calls Massive, Alpaca, or OpenAI.
 
 ## NautilusTrader
 
@@ -169,12 +206,15 @@ Other behavior that matters when you read a report:
 ```
 src/aegis/
   config.py            environment settings
-  cli.py               aegis data|backtest
+  cli.py               aegis data|backtest|research
   holdout.py           protected window
   data/                Massive client, cache, query, validation, universe
   backtest/            risk engine, EMA strategy, report, walk-forward
-  agents/  ml/  execution/  experiments/    later phases
+  agents/              phase-3 prompts, tools, sandbox, workflow
+  ml/  execution/  experiments/             later phases
 config/universe.yaml
 ```
+
+`agents/signal_contract.py` is the plug-in seam (`SignalModel`, `Signal`, `BarView`, the AST policy, the registry). When `aegis.strategies.harness` defines the same names, the sandbox uses that policy and accepts that base class too. Generated modules stay in the research store. They do not edit the harness.
 
 Cache files under `data/cache/` are gitignored.

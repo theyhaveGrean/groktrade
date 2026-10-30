@@ -11,7 +11,7 @@ from datetime import date
 from pathlib import Path
 from typing import Literal
 
-from pydantic import SecretStr, model_validator
+from pydantic import AliasChoices, Field, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from aegis.errors import LiveTradingDisabled, MissingCredentials
@@ -67,6 +67,74 @@ class Settings(BaseSettings):
 
     nautilus_log_level: str = "ERROR"
 
+    # Phase 3 research agents. Model names and budgets are env-configurable.
+    # Prices default to GPT-6.1 Sol ($2 / $10 per million tokens) as published
+    # for that model. Override them if you point AEGIS_RESEARCH_MODEL elsewhere.
+    research_model: str = Field(
+        default="gpt-6.1-sol",
+        validation_alias=AliasChoices("AEGIS_RESEARCH_MODEL", "RESEARCH_MODEL"),
+    )
+    orchestrator_model: str = Field(
+        default="",
+        validation_alias=AliasChoices("AEGIS_ORCHESTRATOR_MODEL", "ORCHESTRATOR_MODEL"),
+    )
+    researcher_model: str = Field(
+        default="",
+        validation_alias=AliasChoices("AEGIS_RESEARCHER_MODEL", "RESEARCHER_MODEL"),
+    )
+    implementer_model: str = Field(
+        default="",
+        validation_alias=AliasChoices("AEGIS_IMPLEMENTER_MODEL", "IMPLEMENTER_MODEL"),
+    )
+    naysayer_model: str = Field(
+        default="",
+        validation_alias=AliasChoices("AEGIS_NAYSAYER_MODEL", "NAYSAYER_MODEL"),
+    )
+    research_max_input_tokens: int = Field(
+        default=150_000,
+        validation_alias=AliasChoices("AEGIS_MAX_INPUT_TOKENS", "RESEARCH_MAX_INPUT_TOKENS"),
+    )
+    research_max_output_tokens: int = Field(
+        default=40_000,
+        validation_alias=AliasChoices("AEGIS_MAX_OUTPUT_TOKENS", "RESEARCH_MAX_OUTPUT_TOKENS"),
+    )
+    research_max_cost_usd: float = Field(
+        default=3.0,
+        validation_alias=AliasChoices("AEGIS_MAX_COST_USD", "RESEARCH_MAX_COST_USD"),
+    )
+    research_max_llm_calls: int = Field(
+        default=24,
+        validation_alias=AliasChoices("AEGIS_MAX_LLM_CALLS", "RESEARCH_MAX_LLM_CALLS"),
+    )
+    research_price_input_per_mtok: float = Field(
+        default=2.0,
+        validation_alias=AliasChoices("AEGIS_PRICE_INPUT_PER_MTOK", "RESEARCH_PRICE_INPUT_PER_MTOK"),
+    )
+    research_price_output_per_mtok: float = Field(
+        default=10.0,
+        validation_alias=AliasChoices("AEGIS_PRICE_OUTPUT_PER_MTOK", "RESEARCH_PRICE_OUTPUT_PER_MTOK"),
+    )
+    research_audit_dir: Path = Field(
+        default=Path("data/audit"),
+        validation_alias=AliasChoices("AEGIS_AUDIT_DIR", "RESEARCH_AUDIT_DIR"),
+    )
+    research_store_dir: Path = Field(
+        default=Path("data/research"),
+        validation_alias=AliasChoices("AEGIS_RESEARCH_DIR", "RESEARCH_STORE_DIR"),
+    )
+    research_prompt_version: str = Field(
+        default="v1",
+        validation_alias=AliasChoices("AEGIS_PROMPT_VERSION", "RESEARCH_PROMPT_VERSION"),
+    )
+    research_sandbox_timeout_seconds: float = Field(
+        default=15.0,
+        validation_alias=AliasChoices("AEGIS_SANDBOX_TIMEOUT_SECONDS", "RESEARCH_SANDBOX_TIMEOUT_SECONDS"),
+    )
+    research_sandbox_memory_mb: int = Field(
+        default=256,
+        validation_alias=AliasChoices("AEGIS_SANDBOX_MEMORY_MB", "RESEARCH_SANDBOX_MEMORY_MB"),
+    )
+
     @model_validator(mode="after")
     def _check_bounds(self) -> Settings:
         if self.holdout_start > self.holdout_end:
@@ -85,7 +153,34 @@ class Settings(BaseSettings):
             raise ValueError("STARTING_EQUITY must be positive.")
         if self.commission_per_share < 0 or self.slippage_bps < 0:
             raise ValueError("Commission and slippage cannot be negative.")
+        if not self.research_model.strip():
+            raise ValueError("AEGIS_RESEARCH_MODEL cannot be empty.")
+        if self.research_max_input_tokens < 1 or self.research_max_output_tokens < 1:
+            raise ValueError("Research token budgets must be at least 1.")
+        if self.research_max_cost_usd <= 0:
+            raise ValueError("AEGIS_MAX_COST_USD must be positive.")
+        if self.research_max_llm_calls < 1:
+            raise ValueError("AEGIS_MAX_LLM_CALLS must be at least 1.")
+        if self.research_price_input_per_mtok < 0 or self.research_price_output_per_mtok < 0:
+            raise ValueError("Token prices cannot be negative.")
+        if self.research_sandbox_timeout_seconds <= 0:
+            raise ValueError("Sandbox timeout must be positive.")
+        if self.research_sandbox_memory_mb < 64:
+            raise ValueError("Sandbox memory budget must be at least 64 MB.")
         return self
+
+    def model_for_agent(self, agent: str) -> str:
+        """Per-role model, falling back to ``AEGIS_RESEARCH_MODEL``."""
+        overrides = {
+            "orchestrator": self.orchestrator_model,
+            "researcher": self.researcher_model,
+            "implementer": self.implementer_model,
+            "naysayer": self.naysayer_model,
+        }
+        chosen = overrides.get(agent, "")
+        if isinstance(chosen, str) and chosen.strip():
+            return chosen.strip()
+        return self.research_model.strip()
 
     @property
     def holdout(self) -> DateRange:

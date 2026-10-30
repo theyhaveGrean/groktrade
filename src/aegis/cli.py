@@ -11,13 +11,15 @@ import typer
 from aegis.config import load_settings
 from aegis.data.pipeline import backfill, build_plan, update
 from aegis.data.validation import validate_bars
-from aegis.errors import AegisError
+from aegis.errors import AegisError, BudgetExceeded
 
 app = typer.Typer(no_args_is_help=True, help="Aegis research foundation.")
 data_app = typer.Typer(no_args_is_help=True, help="Massive 1-minute cache.")
 backtest_app = typer.Typer(no_args_is_help=True, help="EMA crossover baseline.")
+research_app = typer.Typer(no_args_is_help=True, help="Phase-3 research agents.")
 app.add_typer(data_app, name="data")
 app.add_typer(backtest_app, name="backtest")
+app.add_typer(research_app, name="research")
 
 
 def _configure_logging() -> None:
@@ -198,6 +200,46 @@ def backtest_walk_forward(
             f"{fold.fold_index}: train {fold.train_start.isoformat()}..{fold.train_end.isoformat()} "
             f"test {fold.test_start.isoformat()}..{fold.test_end.isoformat()}"
         )
+
+
+@research_app.command("run")
+def research_run(
+    objective: str = typer.Option(..., help="Research objective for the orchestrator to assign."),
+    max_iterations: int = typer.Option(2, "--max-iterations", min=1, help="Propose/critique rounds before the implementer runs."),
+    as_json: bool = typer.Option(False, "--json", help="Print the run record as JSON."),
+) -> None:
+    """Run steps 1-4: assign, propose, critique, implement. Stops before a backtest."""
+    _configure_logging()
+    from aegis.agents.workflow import run_research
+
+    settings = load_settings()
+    try:
+        result = run_research(settings, objective=objective, max_iterations=max_iterations)
+    except BudgetExceeded as exc:
+        typer.secho(str(exc), err=True, fg=typer.colors.RED)
+        partial = getattr(exc, "partial", None)
+        if partial is not None:
+            typer.echo(f"audit: {partial.audit_path}")
+        raise typer.Exit(code=1) from exc
+    except (AegisError, ValueError) as exc:
+        _fail(exc if isinstance(exc, AegisError) else AegisError(str(exc)))
+    if as_json:
+        typer.echo(result.model_dump_json(indent=2))
+        return
+    critique = "none" if result.critique is None else result.critique.verdict
+    sandbox = "not run" if result.implementation is None else result.implementation.status
+    typer.echo(f"run_id: {result.run_id}")
+    typer.echo(f"iterations: {result.iterations}")
+    typer.echo(f"proposal: {result.proposal.name if result.proposal else 'none'}")
+    typer.echo(f"critique: {critique}")
+    typer.echo(f"sandbox: {sandbox}")
+    typer.echo(f"content_hash: {result.candidate_hash or 'none'}")
+    typer.echo(f"advance_to_backtest: {str(result.advance_to_backtest).lower()}")
+    typer.echo(f"backtest_started: {str(result.backtest_started).lower()}")
+    typer.echo(f"stop_reason: {result.stop_reason}")
+    typer.echo(f"audit: {result.audit_path}")
+    if result.implementation is not None:
+        typer.echo(f"candidate: {result.implementation.candidate_dir}")
 
 
 if __name__ == "__main__":

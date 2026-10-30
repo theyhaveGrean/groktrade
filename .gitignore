@@ -7,5 +7,7 @@ dist/
 build/
 .env
 data/cache/
+data/audit/
+data/research/
 *.parquet
 .DS_Store
