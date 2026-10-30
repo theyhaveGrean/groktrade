@@ -1,8 +1,10 @@
-"""Phase 3+ agent roles. Not implemented in this build.
+"""Phase 3 research agents.
 
-Planned roles: Orchestrator, Researcher, Algorithm Implementer, Naysayer,
-Backtesting Analyst, ML Specialist, and Risk & Portfolio Analyst. Each gets
-its own system prompt and tools. None of them can change
-``aegis.backtest.risk.RiskLimits`` or clear a failed validation gate.
-Secrets stay in the environment and never enter a prompt.
+Orchestrator, Researcher, Algorithm Implementer, and Naysayer. Each has a
+versioned system prompt, a private tool list, and a pydantic output. The
+implementer may only write a signal plug-in and its tests. The harness, the
+risk engine, the data package, and the holdout module stay read-only.
+
+This package stays import-light so the sandbox child can load
+``aegis.agents.signal_contract`` without pulling in the OpenAI client.
 """

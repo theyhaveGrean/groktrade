@@ -10,7 +10,7 @@ class MissingCredentials(AegisError):
 
 
 class LiveTradingDisabled(AegisError):
-    """This build refuses live capital."""
+    """This build refuses live capital. Paper mode is the only legal start state."""
 
 
 class MassiveAPIError(AegisError):
@@ -27,3 +27,15 @@ class HoldoutViolation(AegisError):
 
 class RiskEngineNotInstalled(AegisError):
     """A strategy asked for the risk engine before the runner installed it."""
+
+
+class BudgetExceeded(AegisError):
+    """A research run hit its token, call, or dollar cap and stopped."""
+
+    def __init__(self, message: str, *, partial: object | None = None) -> None:
+        super().__init__(message)
+        self.partial = partial
+
+
+class ResearchError(AegisError):
+    """The research workflow could not finish a step."""

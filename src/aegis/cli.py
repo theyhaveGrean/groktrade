@@ -1,4 +1,4 @@
-"""Command line for backfill, cache checks, and the EMA baseline."""
+"""Command line for backfill, cache checks, the EMA baseline, analyst reports, and paper trading."""
 
 from __future__ import annotations
 
@@ -12,13 +12,21 @@ import typer
 from aegis.config import load_settings
 from aegis.data.pipeline import backfill, build_plan, update
 from aegis.data.validation import validate_bars
-from aegis.errors import AegisError
+from aegis.errors import AegisError, BudgetExceeded
 
 app = typer.Typer(no_args_is_help=True, help="Aegis research foundation.")
 data_app = typer.Typer(no_args_is_help=True, help="Massive 1-minute cache.")
-backtest_app = typer.Typer(no_args_is_help=True, help="EMA crossover baseline.")
+backtest_app = typer.Typer(no_args_is_help=True, help="Registered strategy backtests.")
+paper_app = typer.Typer(no_args_is_help=True, help="Alpaca paper trading. Live capital is refused.")
+analyze_app = typer.Typer(no_args_is_help=True, help="Backtest analyst report. Does not run a strategy.")
+optimize_app = typer.Typer(no_args_is_help=True, help="Walk-forward parameter search.")
+research_app = typer.Typer(no_args_is_help=True, help="Research agents. They write signal plug-ins only.")
 app.add_typer(data_app, name="data")
 app.add_typer(backtest_app, name="backtest")
+app.add_typer(paper_app, name="paper")
+app.add_typer(analyze_app, name="analyze")
+app.add_typer(optimize_app, name="optimize")
+app.add_typer(research_app, name="research")
 
 
 def _configure_logging() -> None:
@@ -125,15 +133,16 @@ def data_validate(
 
 @backtest_app.command("demo")
 def backtest_demo(
+    strategy: str = typer.Option("ema_cross", "--strategy", help="Registered strategy name."),
     as_json: bool = typer.Option(False, "--json", help="Print the report as JSON."),
 ) -> None:
-    """Run the EMA baseline on the built-in synthetic sessions. No API key."""
+    """Run a strategy on the built-in synthetic sessions. No API key."""
     _configure_logging()
     from aegis.backtest.engine import run_demo_backtest
 
     settings = load_settings()
     try:
-        report = run_demo_backtest(settings)
+        report = run_demo_backtest(settings, strategy=strategy)
     except (AegisError, ValueError) as exc:
         _fail(exc if isinstance(exc, AegisError) else AegisError(str(exc)))
     typer.echo(json.dumps(report.to_dict(), indent=2) if as_json else report.render())
@@ -144,8 +153,10 @@ def backtest_run(
     start: str = typer.Option(..., help="YYYY-MM-DD."),
     end: str = typer.Option(..., help="YYYY-MM-DD."),
     symbols: str | None = typer.Option(None, help="Comma-separated tickers."),
-    fast: int = typer.Option(20, help="Fast EMA period."),
-    slow: int = typer.Option(50, help="Slow EMA period."),
+    strategy: str = typer.Option("ema_cross", "--strategy", help="Registered strategy name."),
+    fast: int | None = typer.Option(None, help="Fast period when the strategy has fast_period."),
+    slow: int | None = typer.Option(None, help="Slow period when the strategy has slow_period."),
+    timeframe: str | None = typer.Option(None, "--timeframe", help="1min, 5min, 15min, 30min, or 60min."),
     as_json: bool = typer.Option(False, "--json", help="Print the report as JSON."),
 ) -> None:
     """Backtest cached bars. Refuses a range that overlaps the holdout."""
@@ -159,12 +170,28 @@ def backtest_run(
             start=date.fromisoformat(start),
             end=date.fromisoformat(end),
             symbols=_symbols(symbols),
+            strategy=strategy,
             fast_period=fast,
             slow_period=slow,
+            bar_timeframe=timeframe,
         )
     except (AegisError, ValueError) as exc:
         _fail(exc if isinstance(exc, AegisError) else AegisError(str(exc)))
     typer.echo(json.dumps(report.to_dict(), indent=2) if as_json else report.render())
+
+
+@backtest_app.command("signals")
+def backtest_signals() -> None:
+    """Reject signal modules that import outside the sandbox allowlist."""
+    from aegis.strategies.policy import check_signal_package
+
+    result = check_signal_package()
+    if result.passed:
+        typer.echo(f"Signal policy passed ({len(result.files_checked)} files).")
+        return
+    for violation in result.violations:
+        typer.echo(f"{violation.path}:{violation.line}: {violation.message}", err=True)
+    raise typer.Exit(code=1)
 
 
 @backtest_app.command("walk-forward")
@@ -205,8 +232,135 @@ def backtest_walk_forward(
         )
 
 
-optimize_app = typer.Typer(no_args_is_help=True, help="Walk-forward parameter search.")
-app.add_typer(optimize_app, name="optimize")
+def _paper_symbols(symbols: str | None):
+    from datetime import datetime, timezone
+
+    from aegis.data.pipeline import resolve_members
+    from aegis.data.sessions import eastern_date
+
+    settings = load_settings()
+    chosen = resolve_members(settings, _symbols(symbols), eastern_date(datetime.now(timezone.utc)))
+    return settings, [member.symbol for member in chosen]
+
+
+@paper_app.command("run")
+def paper_run(
+    strategy: str = typer.Option(..., "--strategy", help="Strategy id. This build supports ema_crossover."),
+    symbols: str | None = typer.Option(None, help="Comma-separated tickers. Default: the starter universe."),
+) -> None:
+    """Trade the Alpaca paper account from the IEX minute stream.
+
+    Refuses to start unless TRADING_MODE=paper, LIVE_TRADING_ENABLED=false, and
+    ALPACA_BASE_URL is the paper endpoint. Ctrl-C cancels orders and flattens.
+    """
+    _configure_logging()
+    from aegis.execution.broker import connect_paper_broker
+    from aegis.execution.feed import connect_iex_feed
+    from aegis.execution.session import PaperSession
+
+    try:
+        settings, names = _paper_symbols(symbols)
+        if strategy != "ema_crossover":
+            raise AegisError(f"Unknown strategy {strategy!r}. This paper build runs ema_crossover.")
+        broker = connect_paper_broker(settings)
+        feed = connect_iex_feed(settings)
+        session = PaperSession(settings, broker, names, strategy=strategy)
+    except (AegisError, ValueError) as exc:
+        _fail(exc if isinstance(exc, AegisError) else AegisError(str(exc)))
+    try:
+        session.serve(feed)
+    except KeyboardInterrupt:
+        try:
+            session.flatten_all(reason="shutdown")
+        except Exception as exc:
+            typer.secho(f"Shutdown flatten failed: {exc}", err=True, fg=typer.colors.RED)
+        raise typer.Exit(code=130) from None
+
+
+@paper_app.command("status")
+def paper_status(
+    as_json: bool = typer.Option(False, "--json", help="Print the status as JSON."),
+) -> None:
+    """Show the kill switch, broker equity, positions, and the last reconciliation."""
+    _configure_logging()
+    import json
+
+    from aegis.execution.broker import connect_paper_broker
+    from aegis.execution.session import build_status
+
+    settings = load_settings()
+    try:
+        report = build_status(settings, connect_paper_broker(settings))
+    except (AegisError, ValueError) as exc:
+        _fail(exc if isinstance(exc, AegisError) else AegisError(str(exc)))
+    typer.echo(json.dumps(report.to_dict(), indent=2) if as_json else report.render())
+    if report.mismatch:
+        raise typer.Exit(code=2)
+
+
+@paper_app.command("kill")
+def paper_kill() -> None:
+    """Arm the kill file, cancel every open order, and flatten the paper account."""
+    _configure_logging()
+    from aegis.execution.broker import connect_paper_broker
+    from aegis.execution.session import execute_kill
+
+    settings = load_settings()
+    try:
+        execute_kill(settings, connect_paper_broker(settings), reason="aegis paper kill")
+    except (AegisError, ValueError) as exc:
+        _fail(exc if isinstance(exc, AegisError) else AegisError(str(exc)))
+    typer.echo("Kill switch armed. Canceled open orders and flattened positions.")
+
+
+def _emit_analysis(report, *, as_json: bool, out_dir: str | None) -> None:
+    from pathlib import Path
+
+    from aegis.analyst import write_analyst_report
+
+    if out_dir:
+        markdown_path, json_path = write_analyst_report(report, Path(out_dir))
+        typer.echo(f"Wrote {markdown_path} and {json_path}")
+    typer.echo(report.to_json() if as_json else report.to_markdown())
+
+
+@analyze_app.command("demo")
+def analyze_demo(
+    as_json: bool = typer.Option(False, "--json", help="Print the report as JSON."),
+    out_dir: str | None = typer.Option(None, "--out-dir", help="Write report.md and report.json here."),
+) -> None:
+    """Print a full analyst report from a built-in synthetic result. No API key."""
+    from aegis.analyst import build_analyst_report, demo_analysis_input
+
+    settings = load_settings()
+    settings.assert_paper_mode()
+    try:
+        report = build_analyst_report(demo_analysis_input(), holdout=settings.holdout)
+    except (AegisError, ValueError) as exc:
+        _fail(exc if isinstance(exc, AegisError) else AegisError(str(exc)))
+    _emit_analysis(report, as_json=as_json, out_dir=out_dir)
+
+
+@analyze_app.command("report")
+def analyze_report(
+    input_path: str = typer.Option(..., "--input", help="Schema v1 JSON: trades, equity curve, optional folds."),
+    bars: str | None = typer.Option(None, "--bars", help="Parquet bars (symbol, ts, close) for benchmark and regimes."),
+    as_json: bool = typer.Option(False, "--json", help="Print the report as JSON."),
+    out_dir: str | None = typer.Option(None, "--out-dir", help="Write report.md and report.json here."),
+) -> None:
+    """Build the analyst report from a result file. Refuses the holdout. Does not run a strategy."""
+    from pathlib import Path
+
+    from aegis.analyst import build_analyst_report, load_analysis_input
+
+    settings = load_settings()
+    settings.assert_paper_mode()
+    try:
+        analysis = load_analysis_input(Path(input_path), Path(bars) if bars else None)
+        report = build_analyst_report(analysis, holdout=settings.holdout)
+    except (AegisError, ValueError) as exc:
+        _fail(exc if isinstance(exc, AegisError) else AegisError(str(exc)))
+    _emit_analysis(report, as_json=as_json, out_dir=out_dir)
 
 
 def _parse_sets(items: list[str]) -> dict[str, list[str]]:
@@ -332,6 +486,46 @@ def optimize_demo_cmd(
     except (AegisError, ValueError) as exc:
         _fail(exc if isinstance(exc, AegisError) else AegisError(str(exc)))
     typer.echo(report.render())
+
+
+@research_app.command("run")
+def research_run(
+    objective: str = typer.Option(..., help="Research objective for the orchestrator to assign."),
+    max_iterations: int = typer.Option(2, "--max-iterations", min=1, help="Propose/critique rounds before the implementer runs."),
+    as_json: bool = typer.Option(False, "--json", help="Print the run record as JSON."),
+) -> None:
+    """Run the research loop. A candidate that passes the gates is walk-forwarded."""
+    _configure_logging()
+    from aegis.agents.workflow import run_research
+
+    settings = load_settings()
+    try:
+        result = run_research(settings, objective=objective, max_iterations=max_iterations)
+    except BudgetExceeded as exc:
+        typer.secho(str(exc), err=True, fg=typer.colors.RED)
+        partial = getattr(exc, "partial", None)
+        if partial is not None:
+            typer.echo(f"audit: {partial.audit_path}")
+        raise typer.Exit(code=1) from exc
+    except (AegisError, ValueError) as exc:
+        _fail(exc if isinstance(exc, AegisError) else AegisError(str(exc)))
+    if as_json:
+        typer.echo(result.model_dump_json(indent=2))
+        return
+    critique = "none" if result.critique is None else result.critique.verdict
+    sandbox = "not run" if result.implementation is None else result.implementation.status
+    typer.echo(f"run_id: {result.run_id}")
+    typer.echo(f"iterations: {result.iterations}")
+    typer.echo(f"proposal: {result.proposal.name if result.proposal else 'none'}")
+    typer.echo(f"critique: {critique}")
+    typer.echo(f"sandbox: {sandbox}")
+    typer.echo(f"content_hash: {result.candidate_hash or 'none'}")
+    typer.echo(f"advance_to_backtest: {str(result.advance_to_backtest).lower()}")
+    typer.echo(f"backtest_started: {str(result.backtest_started).lower()}")
+    typer.echo(f"stop_reason: {result.stop_reason}")
+    typer.echo(f"audit: {result.audit_path}")
+    if result.implementation is not None:
+        typer.echo(f"candidate: {result.implementation.candidate_dir}")
 
 
 if __name__ == "__main__":

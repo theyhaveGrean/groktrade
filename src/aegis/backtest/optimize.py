@@ -243,6 +243,8 @@ def optimize_on_bars(
     log_level: str = "ERROR",
     ledger_path: Path | None = None,
     study_id: str | None = None,
+    candidate_source: str | None = None,
+    candidate_name: str | None = None,
 ) -> OptimizationReport:
     """Search ``bars`` inside ``start..end``. In-sample selection, out-of-sample score."""
     if method not in {"grid", "random"}:
@@ -300,7 +302,18 @@ def optimize_on_bars(
         for param_index, point in enumerate(points)
     ]
     pool_workers = min(worker_count, len(is_tasks))
-    with _executor(bars, pool_workers, holdout, starting_equity, commission_per_share, slippage_bps, kill_switch, log_level) as pool:
+    with _executor(
+        bars,
+        pool_workers,
+        holdout,
+        starting_equity,
+        commission_per_share,
+        slippage_bps,
+        kill_switch,
+        log_level,
+        candidate_source=candidate_source,
+        candidate_name=candidate_name,
+    ) as pool:
         is_results = list(pool.map(worker_run, is_tasks))
         chosen_tasks = []
         chosen_is: dict[int, dict] = {}
@@ -484,6 +497,12 @@ def worker_init(blob: bytes, config: dict) -> None:
     os.environ["OMP_NUM_THREADS"] = "1"
     _BARS = pl.read_parquet(io.BytesIO(blob))
     _CFG = config
+    source = config.get("candidate_source")
+    name = config.get("candidate_name")
+    if source and name:
+        from aegis.agents.evaluate import register_candidate_source
+
+        register_candidate_source(source, name)
 
 
 def worker_run(task: dict) -> dict:
@@ -532,6 +551,8 @@ def _executor(
     slippage_bps: float,
     kill_switch: bool,
     log_level: str,
+    candidate_source: str | None = None,
+    candidate_name: str | None = None,
 ) -> ProcessPoolExecutor:
     blob = io.BytesIO()
     bars.write_parquet(blob)
@@ -543,6 +564,8 @@ def _executor(
         "slippage_bps": slippage_bps,
         "kill_switch": kill_switch,
         "log_level": log_level,
+        "candidate_source": candidate_source,
+        "candidate_name": candidate_name,
     }
     context = multiprocessing.get_context("spawn")
     return ProcessPoolExecutor(
@@ -759,15 +782,26 @@ def optimize_demo(
     """
     from aegis.backtest.synthetic import OPTIMIZE_DEMO_DAYS, synthetic_bars
 
+    from aegis.strategies.params import search_spec
+
     settings = settings or load_settings()
     settings.assert_paper_mode()
-    smoke = {
-        "fast_period": [5, 8],
-        "slow_period": [21],
-        "atr_period": [10],
-        "atr_multiplier": [2.0],
-        "bar_timeframe": ["1min"],
-    }
+    plugin = get_strategy(strategy)
+    if strategy == "ema_cross":
+        smoke = {
+            "fast_period": [5, 8],
+            "slow_period": [21],
+            "atr_period": [10],
+            "atr_multiplier": [2.0],
+            "bar_timeframe": ["1min"],
+        }
+    else:
+        smoke = {}
+        for name, field in plugin.params_model.model_fields.items():
+            spec = search_spec(field)
+            if spec is None:
+                continue
+            smoke[name] = ["1min"] if name == "bar_timeframe" else [spec.default_grid[0]]
     if param_overrides:
         smoke.update(param_overrides)
     return optimize_on_bars(

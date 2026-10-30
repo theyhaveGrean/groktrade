@@ -1,7 +1,10 @@
-"""Phase 6 Alpaca paper trading. Not implemented in this build.
+"""Alpaca paper trading. The deterministic risk engine gates every order.
 
-Orders will go to ``ALPACA_BASE_URL`` (paper by default). ``TRADING_MODE``
-must stay ``paper`` and ``LIVE_TRADING_ENABLED`` must stay false until a
-separate human approval exists. The risk engine still has to approve every
-order; the broker adapter does not get a private sizing path.
+NautilusTrader 1.231 has no Alpaca adapter, so this package talks to Alpaca
+through alpaca-py and reuses :class:`aegis.backtest.risk.RiskEngine` plus the
+EMA cross from the backtest strategy. Live capital is not implemented.
 """
+
+from aegis.execution.guards import PAPER_TRADING_BASE_URL, assert_paper_execution_allowed
+
+__all__ = ["PAPER_TRADING_BASE_URL", "assert_paper_execution_allowed"]

@@ -26,6 +26,7 @@ class StrategyPlugin:
     summary: str
     params_model: type[StrategyParams]
     run: Callable[..., PerformanceReport]
+    model: type | None = None
 
 
 _REGISTRY: dict[str, StrategyPlugin] = {}
@@ -36,6 +37,13 @@ def register(plugin: StrategyPlugin) -> StrategyPlugin:
         raise ValueError(f"Strategy {plugin.name!r} is already registered.")
     _REGISTRY[plugin.name] = plugin
     return plugin
+
+
+def unregister(name: str) -> None:
+    """Drop a candidate registration. Built-in strategies stay."""
+    if not name.startswith("candidate_"):
+        raise ValueError(f"Refusing to unregister built-in strategy {name!r}.")
+    _REGISTRY.pop(name, None)
 
 
 def get_strategy(name: str) -> StrategyPlugin:
